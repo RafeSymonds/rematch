@@ -73,6 +73,16 @@ def find_function(conn: sqlite3.Connection, spec: str) -> FunctionRecord:
     return FunctionRecord(r[0], r[1], r[2], r[3], r[4], r[5], r[6], bool(r[7]))
 
 
+def load_functions(conn: sqlite3.Connection, ids: list[int]) -> list[FunctionRecord]:
+    cols = "id, name, address, module, tu_path, source_kind, mode, version_cond"
+    out = []
+    for fid in ids:
+        r = conn.execute(f"SELECT {cols} FROM functions WHERE id = ?", (fid,)).fetchone()
+        if r is not None:
+            out.append(FunctionRecord(r[0], r[1], r[2], r[3], r[4], r[5], r[6], bool(r[7])))
+    return out
+
+
 def _include_form(header: str, include_dirs: list[str]) -> str:
     for d in sorted(include_dirs, key=len, reverse=True):
         prefix = d.rstrip("/") + "/"

@@ -366,6 +366,57 @@ def bench(
 
 
 @app.command()
+def pilot(
+    n: int = typer.Option(50, help="Untried assembly functions to attempt."),
+    seed: int = typer.Option(1),
+    workers: int | None = typer.Option(None),
+    model: str | None = typer.Option(None),
+    effort: str | None = typer.Option(None),
+    yes: bool = typer.Option(False, "--yes", help="Confirm token spend."),
+) -> None:
+    """Live attempts on a size-stratified sample of untried assembly functions (spends tokens)."""
+    from rematch.bench.report import format_report, run_metrics
+    from rematch.bench.run import run_functions
+    from rematch.bench.sets import live_sample
+    from rematch.worker.sandbox import load_functions
+
+    s = _session()
+    conn = store.connect(s.db_path)
+    try:
+        ids = live_sample(conn, n, seed)
+        fns = load_functions(conn, ids)
+    finally:
+        conn.close()
+    if not fns:
+        typer.echo("no untried assembly functions")
+        raise typer.Exit(1)
+    m, e = _model_effort(model, effort)
+    effort_for = {} if effort else _effort_by_size(s, [fn.id for fn in fns])
+    _confirm_spend(f"pilot ({len(fns)} live functions)", len(fns), yes)
+    result = run_functions(
+        s,
+        "live",
+        fns,
+        model=m,
+        effort="by-size" if effort_for else e,
+        workers=workers or s.settings.worker_count,
+        bench=False,
+        seed=seed,
+        log=_echo_err,
+        effort_for=effort_for,
+        extra_config={
+            "pilot": {"n": n, "seed": seed, "function_ids": ids},
+            "effort_by_size": s.settings.effort_by_size if effort_for else None,
+        },
+    )
+    conn = store.connect(s.db_path)
+    try:
+        typer.echo(format_report(run_metrics(conn, result.run_id)))
+    finally:
+        conn.close()
+
+
+@app.command()
 def attempt(
     function: str = typer.Argument(..., help="Name, 0xADDR or module:0xADDR."),
     model: str | None = typer.Option(None),

@@ -120,9 +120,12 @@ def render_target(
     return "\n".join([f"; {fn.name} ({fn.mode}, {n} instructions)", *body]) + "\n"
 
 
-def check_script() -> str:
+def check_script(control: Path) -> str:
     rematch = Path(sys.executable).parent / "rematch"
-    return f'#!/bin/sh\nexec "{rematch}" cd --sandbox "$(cd "$(dirname "$0")" && pwd)" "$@"\n'
+    return (
+        f'#!/bin/sh\nexec "{rematch}" cd --sandbox "$(cd "$(dirname "$0")" && pwd)" '
+        f'--control "{control}" "$@"\n'
+    )
 
 
 @dataclass(frozen=True)
@@ -181,9 +184,21 @@ def write_examples(s: Session, examples: tuple[FunctionRecord, ...], out: Path) 
 
 
 def build_sandbox(
-    s: Session, fn: FunctionRecord, out: Path, options: SandboxOptions | None = None
+    s: Session,
+    fn: FunctionRecord,
+    out: Path,
+    options: SandboxOptions | None = None,
+    control: Path | None = None,
 ) -> Task:
+    """Write the sandbox at `out` and its control data (task.json, .target/) at `control`.
+
+    Worker attempts keep the control directory outside the sandbox, under `REMATCH_VAR`, which
+    workers are denied reading; it names the real symbol in bench mode. Other callers default
+    to `out/.control`.
+    """
     opts = options or SandboxOptions()
+    control = (control or out / ".control").resolve()
+    control.mkdir(parents=True, exist_ok=True)
     if out.exists() and any(out.iterdir()):
         raise SandboxError(f"{out} exists and is not empty")
     if opts.bench and fn.source_kind != "c_human":
@@ -207,7 +222,7 @@ def build_sandbox(
         tu_entry = db.entry(fn.tu_path)
         entry = tu_entry if fn.source_kind == "c_human" else db.c_template_for(fn.tu_path)
         obj, lines = _vanilla_lines(s, tu_entry.object_path, fn.name)
-        save_target(out, version, lines, function_view(obj, fn.name, lines, fn.name))
+        save_target(control, version, lines, function_view(obj, fn.name, lines, fn.name))
         if i == 0:
             primary_lines = lines
 
@@ -252,7 +267,7 @@ def build_sandbox(
     # so the worker's report file exists from the start.
     (out / "SUMMARY.json").write_text("{}\n", encoding="utf-8")
     check = out / "check"
-    check.write_text(check_script(), encoding="utf-8")
+    check.write_text(check_script(control), encoding="utf-8")
     check.chmod(0o755)
 
     example_names = write_examples(s, opts.examples, out)
@@ -288,7 +303,7 @@ def build_sandbox(
         objdump=s.settings.objdump,
         compile_timeout=s.settings.compile_timeout_sec,
     )
-    task.save(out)
+    task.save(control)
     return task
 
 

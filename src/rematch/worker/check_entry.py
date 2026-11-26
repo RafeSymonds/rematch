@@ -1,7 +1,8 @@
 """`rematch cd` / `./check`: compile candidate.c, diff against the vanilla target (SPEC §6.4).
 
-Reads only the sandbox (`task.json`, `ctx*.h`, `.target/`, `candidate.c`) and writes only
-`.history/` and the scratch files. Exit codes: 0 MATCH, 1 no match, 3 STOP.
+Reads the sandbox (`ctx*.h`, `candidate.c`) and its control directory (`task.json`,
+`.target/`), which lives outside the sandbox so workers never see it. Writes only `.history/`.
+Exit codes: 0 MATCH, 1 no match, 3 STOP.
 """
 
 from __future__ import annotations
@@ -40,8 +41,8 @@ _OWN_CTX_INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"ctx\.h"[^\n]*$', re.
 # --- target cache (written by the sandbox builder) -----------------------------------
 
 
-def save_target(sandbox: Path, version: str, lines: list[Line], view: FunctionView) -> None:
-    path = sandbox / TARGET_CACHE / f"{version}.json"
+def save_target(control: Path, version: str, lines: list[Line], view: FunctionView) -> None:
+    path = control / TARGET_CACHE / f"{version}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     data = {
         "lines": [asdict(line) for line in lines],
@@ -55,8 +56,8 @@ def save_target(sandbox: Path, version: str, lines: list[Line], view: FunctionVi
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
-def load_target(sandbox: Path, version: str) -> tuple[list[Line], FunctionView]:
-    data = json.loads((sandbox / TARGET_CACHE / f"{version}.json").read_text(encoding="utf-8"))
+def load_target(control: Path, version: str) -> tuple[list[Line], FunctionView]:
+    data = json.loads((control / TARGET_CACHE / f"{version}.json").read_text(encoding="utf-8"))
     lines = [Line(**item) for item in data["lines"]]
     v = data["view"]
     view = FunctionView(
@@ -146,7 +147,7 @@ def stop_line(reason: str) -> str:
 
 
 def evaluate(
-    sandbox: Path, task: Task, candidate: str, build: Path
+    sandbox: Path, task: Task, candidate: str, build: Path, control: Path | None = None
 ) -> tuple[str | None, list[str], list[VersionResult]]:
     """Pre-filter, compile and diff `candidate` for every required version.
 
@@ -188,7 +189,7 @@ def evaluate(
         ).get(task.symbol)
         if clines is None:
             return None, [f"{task.symbol} was not emitted by the compiler"], []
-        tlines, tview = load_target(sandbox, vt.version)
+        tlines, tview = load_target(control or sandbox, vt.version)
         m = binary_match(tview, function_view(cobj, task.symbol, clines, task.symbol))
         ops = align(tlines, clines)
         results.append(
@@ -206,9 +207,12 @@ def evaluate(
     return None, [], results
 
 
-def run_check(sandbox: Path, json_out: Path | None = None) -> tuple[str, int, CheckResult | None]:
+def run_check(
+    sandbox: Path, json_out: Path | None = None, control: Path | None = None
+) -> tuple[str, int, CheckResult | None]:
     start = time.perf_counter()
-    task = Task.load(sandbox)
+    control = control or sandbox
+    task = Task.load(control)
     (sandbox / HISTORY).mkdir(exist_ok=True)
     state = State.load(sandbox)
     reason = _stop_reason(state, task)
@@ -220,7 +224,9 @@ def run_check(sandbox: Path, json_out: Path | None = None) -> tuple[str, int, Ch
     candidate = (sandbox / "candidate.c").read_text(encoding="utf-8", errors="replace")
     (sandbox / HISTORY / f"{n:03d}.c").write_text(candidate, encoding="utf-8")
 
-    rejected, errors, results = evaluate(sandbox, task, candidate, sandbox / HISTORY / "build")
+    rejected, errors, results = evaluate(
+        sandbox, task, candidate, sandbox / HISTORY / "build", control
+    )
     if rejected is not None:
         result = CheckResult(n, "rejected", 0.0, False, 0.0, reason=rejected)
         text = f"check {n}/{task.max_checks} | REJECTED: {rejected}"

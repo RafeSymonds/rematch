@@ -487,8 +487,10 @@ $REMATCH_WORKDIR/attempts/<attempt_id>/
   LEARNINGS.md     # copy of docs/LEARNINGS.md
   candidate.c      # starts as draft.c or a stub with the right signature if known
   check            # executable wrapper → rematch cd (§6.4)
-  task.json        # symbol, target symbol, TU, mode, per-version compile argv and context, limits
   ctx.<version>.h  # context for each extra version of a version-conditional TU
+
+$REMATCH_VAR/runs/<run>/<attempt>/control/   # outside the sandbox; workers are denied reading it
+  task.json        # symbol, target symbol, TU, mode, per-version compile argv and context, limits
   .target/         # normalized vanilla lines and match view per version (written by the builder)
   NOTES.md         # worker may append proposed learnings here
   SUMMARY.json     # worker writes at the end (untrusted)
@@ -497,7 +499,7 @@ $REMATCH_WORKDIR/attempts/<attempt_id>/
 
 Before launch: compute SHA-256 of every file except `candidate.c`, `NOTES.md`, `SUMMARY.json` and `.history/**`, and `chmod 0444` them (`check` 0555). The manifest is stored outside the sandbox (`var/runs/<run>/<attempt>/manifest.json`). After the attempt: re-hash. Any modified, missing or added file means outcome `invalid`. `./check` writes its scratch sources and objects under `.history/build/`, outside the seal. Sandboxes live at `REMATCH_WORKDIR/attempts/<attempt_id>`.
 
-Bench presentation (§7.2) also scrubs ctx.h: the target's prototype is renamed to the anonymous symbol, and comments are stripped from the TU-local declarations. `task.json` and `.target/` name the real symbol, so workers are denied reading them (§7.3).
+Bench presentation (§7.2) also scrubs ctx.h: the target's prototype is renamed to the anonymous symbol, and comments are stripped from the TU-local declarations. `task.json` and `.target/` name the real symbol, so they live in the attempt's control directory under `REMATCH_VAR` (read-denied, §7.3). The `check` script passes it to `rematch cd --control`. Workers kept trying to read `task.json` when it sat in the sandbox (15 denied tries in the baseline run).
 
 ### 7.2 Bench presentation rule
 
@@ -515,7 +517,7 @@ claude -p "$(cat TASK.md)" \
   --tools "Read,Edit,Write,Bash" \
   --allowedTools "Read" "Edit(candidate.c)" "Write(candidate.c)" "Edit(NOTES.md)" \
                  "Write(NOTES.md)" "Edit(SUMMARY.json)" "Write(SUMMARY.json)" "Bash(./check)" \
-  --disallowedTools "Read(task.json)" "Read(.target/**)" "Read(//<deny root>/**)" ... \
+  --disallowedTools "Read(//<deny root>/**)" ... \
   --permission-mode dontAsk --permission-prompts none \
   --setting-sources project,local \
   --strict-mcp-config --disable-slash-commands \

@@ -5,8 +5,8 @@ Isolation (verified by probes, docs/verify-log.md):
   only, and Bash only for the exact command `./check`; `dontAsk` + `--permission-prompts none`
   deny everything else without prompting
 - reads are allowed anywhere by default, so reads of the target repo, the vanilla worktree,
-  rematch itself and answer-bearing sandboxes are denied explicitly, as are task.json and
-  .target/ inside the sandbox (they name the human target in bench mode)
+  rematch itself (including the attempt's control directory under REMATCH_VAR, which names the
+  human target in bench mode) and answer-bearing sandboxes are denied explicitly
 - `--setting-sources project,local` drops user settings (hooks, plugins, output style)
 """
 
@@ -33,7 +33,6 @@ ALLOWED_TOOLS = (
     "Write(SUMMARY.json)",
     "Bash(./check)",
 )
-SANDBOX_DENIED_READS = ("Read(task.json)", "Read(.target/**)")
 
 
 @dataclass(frozen=True)
@@ -100,7 +99,6 @@ def worker_argv(cfg: InvokeConfig, prompt: str) -> list[str]:
         "--allowedTools",
         *ALLOWED_TOOLS,
         "--disallowedTools",
-        *SANDBOX_DENIED_READS,
         *(deny_rule(p) for p in cfg.deny_read_roots),
         "--permission-mode",
         "dontAsk",

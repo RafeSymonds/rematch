@@ -250,8 +250,6 @@ def test_worker_argv_isolation_flags(tmp_path: Path) -> None:
         "--no-session-persistence",
         "--output-format stream-json",
         "Bash(./check)",
-        "Read(task.json)",
-        "Read(.target/**)",
         deny_rule(tmp_path / "secret"),
     ):
         assert flag in joined

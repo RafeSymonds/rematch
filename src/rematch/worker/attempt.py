@@ -168,7 +168,8 @@ def run_attempt(s: Session, spec: AttemptSpec, log: Log) -> tuple[int, Classifie
         attempt_id = cur.lastrowid
         sandbox = s.settings.rematch_workdir.expanduser() / "attempts" / str(attempt_id)
         run_dir = s.settings.rematch_var / "runs" / str(spec.run_id) / str(attempt_id)
-        task = build_sandbox(s, spec.fn, sandbox, spec.options)
+        control = run_dir / "control"  # outside the sandbox, under the read-denied REMATCH_VAR
+        task = build_sandbox(s, spec.fn, sandbox, spec.options, control)
         manifest = seal(sandbox)
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
@@ -188,7 +189,7 @@ def run_attempt(s: Session, spec: AttemptSpec, log: Log) -> tuple[int, Classifie
         stream = s.settings.rematch_var / "logs" / str(spec.run_id) / f"{attempt_id}.jsonl"
         prompt = (sandbox / "TASK.md").read_text(encoding="utf-8")
         result = run_worker(cfg, sandbox, prompt, stream)
-        c = classify(sandbox, manifest, result, task)
+        c = classify(sandbox, manifest, result, task, control)
 
         best_path = None
         if c.best_check is not None:

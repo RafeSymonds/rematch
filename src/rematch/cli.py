@@ -106,6 +106,7 @@ def inventory(
 def cd(
     sandbox: Path = typer.Option(Path("."), help="Sandbox directory."),
     json_out: Path | None = typer.Option(None, help="Also write the result JSON here."),
+    control: Path | None = typer.Option(None, help="Control dir (task.json); default: sandbox."),
     mode: str = typer.Option("isolated", help="Compile mode (only isolated in Phase 1)."),
 ) -> None:
     """Compile candidate.c and diff it against the target (what ./check runs)."""
@@ -114,7 +115,7 @@ def cd(
     if mode != "isolated":
         typer.echo(f"mode {mode!r} is not available yet")
         raise typer.Exit(2)
-    text, code, _ = run_check(sandbox.resolve(), json_out)
+    text, code, _ = run_check(sandbox.resolve(), json_out, control.resolve() if control else None)
     typer.echo(text)
     raise typer.Exit(code)
 

@@ -190,6 +190,7 @@ This repo is target-agnostic: no game names, target paths, host names or persona
 | `ANTHROPIC_API_KEY` | (empty) | API mode only |
 | `WORKER_MODEL` | `sonnet` | Default model alias |
 | `WORKER_EFFORT` | `high` | |
+| `EFFORT_BY_SIZE` | `S:medium,M:high,L:high` | Effort per size bucket (§11.2) when `--effort` isn't given. Empty means `WORKER_EFFORT` for all. |
 | `ESCALATION_LADDER` | `sonnet:high,sonnet:xhigh,opus:high,opus:xhigh` | §8.4 |
 | `MAX_TURNS` | `60` | Passed as `--max-turns` |
 | `MAX_CHECKS` | `40` | Enforced by `./check` |
@@ -396,7 +397,8 @@ For each function, produce a sandbox `ctx.h`:
 3. Flatten them via `make_context` (for example a target-provided m2ctx-style script run on a stub `.c` that includes those headers). Strip the target function's own prototype only if it would conflict. Keep it otherwise, because a correct prototype is legitimate info.
 4. Bench mode: the context must not contain the target's body. Headers never contain bodies, but static inline functions defined in headers are fine.
 5. Append the accepted shared types (§16.2) relevant to the function, after the flattened headers and before TU-local declarations: types used by matches in the same TU, by its callers or by its callees. Types not yet materialized in a header exist only here.
-6. Record `context_version` (bump whenever builder logic changes).
+6. The sandbox's TASK.md (the worker's first prompt) inlines `target.s`, `LEARNINGS.md`, and the declarations the function needs, cut from its own ctx.h with ctags (start/end lines): the target's prototype, its callees' prototypes, the externs and statics it references (relocation targets with addends stripped), and the struct/union/enum definitions those mention, one level deep (≤ 90 lines per type, ≤ 200 in total, each with its `ctx.h:<line>`). Phase 2 transcripts showed 81% of all tool output was workers grepping a ~1 MB ctx.h.
+7. Record `context_version` (bump whenever builder logic changes).
 
 ### 6.4 Compile-and-diff (`rematch cd`): the worker's only tool
 
@@ -430,7 +432,7 @@ Relocations are read as RELA; REL implicit addends are decoded from the patched 
 
 **Backends:**
 The backend only produces the rows for score, hints and rendering:
-- `objdump` (default): `$OBJDUMP -d -r --no-show-raw-insn`, relying on the objects' ARM mapping symbols for the mode (TARGET.md records whether a target's objects carry them). Lines are normalized: offsets relative to the function, local branch targets as `.L<k>` (numbered by target order), calls and pool loads show the normalized target (`ldr r0, =Symbol`, `ldr r0, =0x1f4`).
+- `objdump` (default): `$OBJDUMP -d -r -z --no-show-raw-insn` (`-z`: relocated literal-pool words are all zeros in RELA objects and would otherwise be collapsed into `...`), relying on the objects' ARM mapping symbols for the mode (TARGET.md records whether a target's objects carry them). Lines are normalized: offsets relative to the function, local branch targets as `.L<k>` (numbered by target order), calls and pool loads show the normalized target (`ldr r0, =Symbol`, `ldr r0, =0x1f4`).
 - `objdiff`: `objdiff-cli diff -1 A -2 B -o - --format json` has a one-shot mode, but it emits a whole-object `DiffResult`. Adopt it only if objdump rows prove insufficient.
 
 ### 6.6 Text rendering and hints (what the worker sees)
@@ -543,6 +545,7 @@ Notes:
 - Timeout: send SIGINT at `ATTEMPT_TIMEOUT_SEC`, which ends the turn cleanly, then SIGTERM after 30 s (exit 143), then SIGKILL after 10 s more.
 - Parse the final `result` event for `num_turns`, usage tokens and `total_cost_usd`. Cost is a client-side estimate.
 - Save the full stream to `var/logs/<run_id>/<attempt_id>.jsonl` (stderr next to it).
+- **Rate and usage limits:** a result whose error mentions a rate limit, usage limit, 429/529 or overload doesn't end the attempt. The run's shared gate pauses new attempts: until the stated reset time for usage limits (at most 6 h), otherwise exponential backoff (60 s doubling, at most 15 min). Then the same session is resumed with `--resume <session_id>` and a short "continue" prompt, which is why sessions are persisted (no `--no-session-persistence`). If the session can't be resumed, a fresh session continues in the same sandbox, where `candidate.c`, `.history/` and the check count survive. Turn and time budgets carry over, tokens and cost are summed across segments (`<attempt>.rN.jsonl`), and after 5 resumes the attempt is classified as usual.
 
 ### 7.4 Outcome classification
 
@@ -743,12 +746,12 @@ Names don't change code bytes, but they make the source useful. A cheaper model 
 
 ---
 
-## Appendix A: `prompts/worker_system.md` (draft, prompt_version: 1)
+## Appendix A: `prompts/worker_system.md` (prompt_version: 2)
 
 `{{ target_intro }}` is filled from the target (a `target.toml` field added in Phase 2), for example the platform, compiler and default ISA mode.
 
 ```markdown
-prompt_version: 1
+prompt_version: 2
 
 You are doing matching decompilation. {{ target_intro }} Your job: write C in
 candidate.c that compiles to EXACTLY the instructions in target.s.
@@ -764,7 +767,11 @@ Rules:
   redundant casts). The code must read like plausible original source.
 - Name unknown struct fields unk_XX by hex offset. Do not invent meaningful
   names without evidence (callee names, strings, constants).
-- Use ctx.h for types and prototypes; do not redefine what it declares.
+- TASK.md already contains target.s, the declarations this function needs and
+  LEARNINGS.md. ctx.h (about 1 MB) has everything else: grep it for specific
+  names only, never read it whole. Do not redefine what it declares.
+- Write a first draft and run ./check within your first few turns. The diff
+  teaches more than reading; iterate from it.
 - If ctx.h has no type for a struct you access, declare one in the
   provisional-types block at the top of candidate.c:
     /* rematch:types */
@@ -776,9 +783,8 @@ Rules:
   <ADDR> is your function's address; add _1, _2 for more types. Fields are
   unk_XX by hex offset, gaps are u8 arrays. Prefer fields over pointer math
   like *(u16 *)((u8 *)p + 0x2C).
-- Read examples/ first: they are similar functions that already match. Copy
-  their idioms.
-- Read LEARNINGS.md: compiler quirks discovered so far.
+- examples/ holds similar functions that already match; skim one or two for
+  idioms when the diff is stuck, not before your first draft.
 - If ./check says STOP, write SUMMARY.json and end immediately.
 - Don't flail. If the score hasn't improved in a few checks, step back, re-read
   target.s, and change the structure (loop form, if/else vs ternary, variable
@@ -791,20 +797,46 @@ and, if you learned something general about this compiler, append one-line
 bullets to NOTES.md (e.g. "- u8 locals compared to constants emit lsl/lsr; use int").
 ```
 
-## Appendix B: `prompts/task.md.j2` (draft)
+## Appendix B: `prompts/task.md.j2` (context_version 4; inner code fences shown as ~~~)
 
 ```markdown
 # Task: match {{ symbol }} ({{ mode }}, {{ n_insns }} instructions, module {{ module }})
 
-Files:
-- target.s: the original assembly for {{ symbol }} (and its literal pool)
-- ctx.h: types, prototypes, constants
-- examples/: {{ examples|length }} similar functions with matching C
-{% if draft %}- draft.c: an automatic first draft (often wrong in details){% endif %}
-{% if previous_best %}- previous_best.c / previous_best.diff: best earlier attempt ({{ previous_best_score }}%){% endif %}
+This message already contains target.s, the declarations from ctx.h that this function
+needs, and LEARNINGS.md. You don't need to open those files.
+
+## target.s
+
+~~~
+{{ target_s }}
+~~~
+
+## Declarations you need (cut from ctx.h; line numbers refer to ctx.h)
+
+~~~c
+{{ declarations if declarations else "/* none found: grep ctx.h by name */" }}
+~~~
+
+## Other files
+
+- ctx.h: the full context ({{ ctx_kb }} KB). Grep it for specific names; never read it whole.
+- examples/: {{ examples|length }} similar functions with matching C{% if examples %} ({{ examples|join(", ") }}){% endif %}
+
+{% if draft %}
+- draft.c: an automatic first draft (often wrong in details)
+{% endif %}
+{% if previous_best %}
+- previous_best.c / previous_best.diff: best earlier attempt ({{ previous_best_score }}%)
+{% endif %}
+
+## LEARNINGS.md
+
+{{ learnings }}
 
 Budget: at most {{ max_checks }} runs of ./check. Stop early if you match.
-{% if version_cond %}This function is checked against every target version.{% endif %}
+{% if version_cond %}
+This function is checked against every target version.
+{% endif %}
 
 Write the function {{ symbol }} in candidate.c, run ./check, iterate to MATCH.
 ```

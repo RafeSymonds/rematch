@@ -25,7 +25,7 @@ rematch is built with coding agents. This file covers the workflow for humans an
 
 - Compare changes **only** on frozen sets, by default `b100-s42-c20260701` (clean pool), confirmed on a second set before claiming a win.
 - Change one thing per comparison. If you must bundle changes, say so in the log.
-- Append one row per run to `docs/benchmarks.md`:
+- `rematch bench` appends one row per run to the target's `.rematch/benchmarks.md` (rows name the target, so they stay out of this repo):
 
 ```
 | date | target | run | set | prompt_v | context_v | model:effort | match % (S/M/L) | med checks | tokens/match | $/match (est) | notes |

@@ -25,7 +25,7 @@ def test_defaults_and_user_expansion(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.build_timeout_sec == 3600
     assert settings.max_checks == 40
     assert settings.version_override() == []
-    assert settings.db_path("demo") == Path("var") / "demo.sqlite"
+    assert settings.db_path("demo") == (Path("var") / "demo.sqlite").resolve()
 
 
 def test_env_file_loading_and_empty_db(tmp_path: Path) -> None:

@@ -84,7 +84,20 @@ overlay_anonymous = "ov{overlay:02d}_{address:08X}"
 
 Phase 1 sections are optional for validation, and the commands that need one fail with a message naming the missing table. `[build]` requires `build_dir` in every version. Formats are names of parsers implemented in rematch for toolchain and ecosystem formats (never per-game code). Adding a format means adding a parser with fixture tests. The `[context]` command runs through `TOOLCHAIN_EXEC` with cwd = the vanilla worktree, receives a stub `.c` containing `#include` lines as `{input}`, and prints a flattened context (types, prototypes and macro definitions) on stdout.
 
-### 2.1.2 Phase 4 fields
+### 2.1.2 Phase 2 fields
+
+```toml
+[link_order]
+history = ["old_link.lsf"]                 # older link-order file names, tried at commits where `file` is missing (§11.1)
+
+[asm]
+address_version = "us"                     # version whose addresses the assembly's address comments use (§11.1)
+
+[worker]
+intro = "The target is ... compiled with ..., Thumb mode unless target.s says otherwise."   # Appendix A {{ target_intro }}
+```
+
+### 2.1.3 Phase 4 fields
 
 ```toml
 [types]
@@ -147,7 +160,6 @@ rematch/
     tu_data_task.md.j2
     curate.md
   docs/
-    benchmarks.md                # append-only benchmark log (CONTRIBUTING.md)
     LEARNINGS.md                 # curated compiler quirks, injected into sandboxes
     verify-log.md                # evidence for resolved rematch VERIFY items
   tests/
@@ -483,38 +495,50 @@ $REMATCH_WORKDIR/attempts/<attempt_id>/
   .history/        # written only by ./check
 ```
 
-Before launch: compute SHA-256 of every file except `candidate.c`, `NOTES.md` and `SUMMARY.json`, and `chmod 0444` them. After the attempt: re-hash. Any change means outcome `invalid`.
+Before launch: compute SHA-256 of every file except `candidate.c`, `NOTES.md`, `SUMMARY.json` and `.history/**`, and `chmod 0444` them (`check` 0555). The manifest is stored outside the sandbox (`var/runs/<run>/<attempt>/manifest.json`). After the attempt: re-hash. Any modified, missing or added file means outcome `invalid`. `./check` writes its scratch sources and objects under `.history/build/`, outside the seal. Sandboxes live at `REMATCH_WORKDIR/attempts/<attempt_id>`.
+
+Bench presentation (§7.2) also scrubs ctx.h: the target's prototype is renamed to the anonymous symbol, and comments are stripped from the TU-local declarations. `task.json` and `.target/` name the real symbol, so workers are denied reading them (§7.3).
 
 ### 7.2 Bench presentation rule
 
 The target function's own name is replaced with `anonymous_name(module, address)` (typically `sub_<ADDR>`) in `target.s`, `TASK.md` and the expected symbol. Callee names stay as they are in the pin. **Known realism gap (v1):** callees may have human-chosen names that weren't available when the function was decompiled. A "historical presentation" mode that uses names from the cutoff-commit snapshot and maps them through addresses is a Phase 3+ improvement.
 
-### 7.3 Invocation (verified against Claude Code docs, Nov 2026)
+### 7.3 Invocation (verified by probes on Claude Code 2.1.332, 2026-11-26; docs/verify-log.md)
 
-Run from the sandbox directory (cwd = sandbox).
+Run from the sandbox directory (cwd = sandbox), stdin closed, prompt = the contents of TASK.md.
 
 **Subscription mode (default):**
 ```bash
 claude -p "$(cat TASK.md)" \
   --model "$MODEL" --effort "$EFFORT" \
-  --append-system-prompt-file "$REMATCH/prompts/worker_system.md" \
+  --append-system-prompt-file "$VAR/runs/<run>/worker_system.md" \
   --tools "Read,Edit,Write,Bash" \
-  --allowedTools "Read" "Edit" "Write" "Bash(./check)" \
+  --allowedTools "Read" "Edit(candidate.c)" "Write(candidate.c)" "Edit(NOTES.md)" \
+                 "Write(NOTES.md)" "Write(SUMMARY.json)" "Bash(./check)" \
+  --disallowedTools "Read(task.json)" "Read(.target/**)" "Read(//<deny root>/**)" ... \
   --permission-mode dontAsk --permission-prompts none \
+  --setting-sources project,local \
   --strict-mcp-config --disable-slash-commands \
   --max-turns "$MAX_TURNS" \
   --no-session-persistence \
   --output-format stream-json --verbose
 ```
 
-**API mode:** the same command plus `--bare` and `--max-budget-usd "$MAX_BUDGET_USD_PER_ATTEMPT"`, with `ANTHROPIC_API_KEY` set. Bare mode doesn't use subscription login.
+Deny roots (reads denied): `TARGET_REPO`, the vanilla worktree, the rematch repo, `REMATCH_VAR`, `REMATCH_WORKDIR/{roundtrip,prescreen,selftest}` and every `REFERENCE_REPOS` path. `--disallowedTools` rules beat `--allowedTools`, and `//` marks an absolute path. The worker system prompt is rendered once per run (Appendix A, with the target's `[worker] intro`). Paths handed to the worker are absolute.
+
+**API mode:** the same command plus `--bare` and `--max-budget-usd "$MAX_BUDGET_USD_PER_ATTEMPT"`, with `ANTHROPIC_API_KEY` set. Bare mode doesn't use subscription login. In subscription mode `ANTHROPIC_API_KEY` is removed from the worker's environment, so no attempt bills an API key by accident.
+
+Probe results (2026-11-26):
+- Reads are allowed **anywhere** by default, including outside the sandbox. The deny rules above block them ("File is in a directory that is denied by your permission settings"). Without them a bench worker could read the human C. Writes outside the allowed files, and any Bash command other than exactly `./check` (including `./check; echo`), are denied.
+- `--setting-sources project,local` keeps the subscription login and drops user settings: output style, user agents, user plugins and hooks. `--disable-slash-commands` and `--strict-mcp-config` leave no skills and no MCP servers.
+- **Known confound:** the user-level `~/.claude/CLAUDE.md` still loads in subscription mode (memory isn't a setting source). Avoiding it requires API mode (`--bare`) or a dedicated `CLAUDE_CONFIG_DIR` with its own login. Benchmark rows note which one applied.
+- `--max-turns` still works in 2.1.332, although `--help` no longer lists it (result subtype `error_max_turns`). `--effort` is accepted.
 
 Notes:
 - In `dontAsk`, anything not allowed is denied without prompting, and `--permission-prompts none` tells Claude not to retry denied calls. Requires Claude Code ≥ 2.1.259.
-- **VERIFY (Phase 2):** in subscription mode, inspect the `system/init` event and the first turn for leaked user-level configuration (`~/.claude` CLAUDE.md, hooks, plugins). If anything leaks, run workers with a dedicated Claude config directory, or switch to API mode.
-- Timeout: send SIGINT at `ATTEMPT_TIMEOUT_SEC`, which ends the turn cleanly, then SIGTERM after 30 s (exit 143).
+- Timeout: send SIGINT at `ATTEMPT_TIMEOUT_SEC`, which ends the turn cleanly, then SIGTERM after 30 s (exit 143), then SIGKILL after 10 s more.
 - Parse the final `result` event for `num_turns`, usage tokens and `total_cost_usd`. Cost is a client-side estimate.
-- Save the full stream to `var/logs/<run_id>/<attempt_id>.jsonl`.
+- Save the full stream to `var/logs/<run_id>/<attempt_id>.jsonl` (stderr next to it).
 
 ### 7.4 Outcome classification
 
@@ -524,6 +548,7 @@ After exit: re-hash the sandbox (`invalid` if anything changed). Then re-run `re
 - 100% match but lint fail → `nonmatch` (lint failure noted). It stays retryable with the lint errors shown next time.
 - Otherwise the most specific of: `compile_fail` (never compiled), `stagnation`, `check_limit`, `turn_limit`, `timeout`, `budget`, `nonmatch`, `error`
 - Parse `NOTES.md` bullets into `learning_candidates`.
+- Bench runs record the `attempts` row only. Live and selftest runs also update the function's status, `matches` and provisional types.
 - On `match`, record the candidate's provisional types (§16.1) in `provisional_types`, with offsets and sizes measured by the compiler.
 
 ---
@@ -598,9 +623,16 @@ Runs only in the live worktree on branch `rematch/live`, one TU at a time, seria
 
 ### 11.1 Pool
 
-- `decompiled_at` for each `c_human` function = the first first-parent commit where its `(module, address)` disappears from assembly. Computed by `inventory/history.py`, which walks snapshots at roughly weekly granularity, then bisects.
-- Clean pool = `c_human` functions with `decompiled_at > BENCH_CUTOFF_DATE`.
+- `decompiled_at` for each `c_human` function = the committer date of the first first-parent commit where it is no longer in assembly. Only dates after the cutoff matter, so `inventory/history.py`:
+  - takes the last first-parent commit before `BENCH_CUTOFF_DATE` (midnight UTC)
+  - keys functions by (overlay index or block name, address). Overlay names change over time, indices don't. Addresses come from the assembly's address comments, in the `[asm] address_version` version's addresses, and are resolved for human-C functions through that version's map.
+  - reads each commit's link order (`[link_order] file`, then the `history` fallbacks, whose `x.o` objects resolve to existing sources) and its assembly through `git cat-file --batch`
+  - bisects the first-parent commits between the cutoff commit and the pin, grouping functions that leave in the same commit.
+
+  Functions already in C at the cutoff get `NULL`.
+- Clean pool = `c_human` functions with `decompiled_at >= BENCH_CUTOFF_DATE`.
 - "Possibly contaminated" pool = everything else, reported separately and never mixed.
+- **Pre-screen:** a pool function is eligible only if its own human C matches in isolated mode (a round-trip). The few that need TU context can't be matched by any worker in isolated mode. Results are cached per pin and `context_version` (`var/<target>.prescreen.json`). Sampling screens lazily, so only about N functions are compiled per set, and rejections are reported.
 
 ### 11.2 Sets
 
@@ -610,7 +642,7 @@ Runs only in the live worktree on branch `rematch/live`, one TU at a time, seria
 
 ### 11.3 Metrics (`rematch report`)
 
-Per run, overall and per size bucket: match rate; first-check compile rate; median checks to match; median turns; mean input, output and cache tokens per attempt and per match; cost per match (estimate); wall time per attempt; outcome distribution; lint-failure rate; escalation rung at match. Append a summary row to `docs/benchmarks.md` (format in CONTRIBUTING.md).
+Per run, overall and per size bucket: match rate; first-check compile rate; median checks to match; median turns; mean input, output and cache tokens per attempt and per match; cost per match (estimate); wall time per attempt; outcome distribution; lint-failure rate; escalation rung at match. `rematch bench` appends a summary row to the **target's** `.rematch/benchmarks.md` (format in CONTRIBUTING.md). Rows name the target, and this repo stays target-agnostic.
 
 ---
 
@@ -624,13 +656,13 @@ Fetch `upstream`, merge into the target's `main` (never push upstream), then reb
 
 ```
 rematch doctor                      # Claude Code version, workdir, push guard, vanilla builds, hashes, DB
-rematch inventory [--history]       # parse target; --history computes decompiled_at
-rematch selftest                    # oracle + saboteur agents, zero tokens (§14)
+rematch inventory [--history]       # parse target; --history computes decompiled_at (§11.1)
+rematch selftest [--n 10 --workers 4]   # oracle + saboteur agents, zero tokens (§14)
 rematch cd --sandbox DIR [--json-out F] [--mode isolated|tu]   # used by ./check
 rematch ctx FUNCTION --out DIR [--with-source]   # build a sandbox without a worker; --with-source seeds human C (never for bench)
 rematch roundtrip [--n N --seed S | --golden]    # human C through ./check must match (Phase 1 exit; .rematch/golden.toml)
-rematch attempt FUNCTION [--model M --effort E]                # one live attempt
-rematch bench --n N --seed S [--pool clean] [--workers W] [--model M --effort E]
+rematch attempt FUNCTION [--model M --effort E] --yes          # one live attempt
+rematch bench --n N --seed S [--pool clean|contaminated] [--workers W] [--model M --effort E] --yes
 rematch run --workers W [--max-attempts K] [--until HH:MM]     # live loop
 rematch integrate [--tu TU | --ready | --verify-branch]        # --verify-branch: rebuild every rematch/live commit, check hashes
 rematch report [--run ID | --last] [--compare ID]
@@ -653,8 +685,9 @@ Every command that can spend tokens (`attempt`, `bench`, `run`) prints an estima
 
 - Unit: asm parser (fixtures with each ISA mode, pools, switch tables, conditional blocks), C parser, header index, difficulty, similarity, lints, hint rules (one fixture per rule), score function (golden alignments), target.toml validation, doctor checks.
 - `rematch cd` golden tests: 20 known human-C functions compiled from their original C must report `match: true`. 5 deliberately mutated variants must report the expected diff categories.
-- **Oracle agent** (`selftest/oracle_agent.py`): a fake `claude` that copies the human C into `candidate.c` and runs `./check`. A full bench run on 10 functions must yield 10 matches, end to end through the orchestrator and DB, with zero model calls.
-- **Saboteur agent:** tries to edit `ctx.h` or `target.s` and write outside the sandbox. It must produce outcome `invalid`, and the vanilla worktree must be byte-identical afterwards.
+- **Oracle agent** (`selftest/oracle_agent.py`): a fake `claude` that writes the human C, renamed to the anonymous symbol, into `candidate.c` and runs `./check`. It reads the answers from a file outside the sandbox. A bench-presentation run on 10 pre-screened clean-pool functions must yield 10 matches, end to end through sandbox, seal, invocation, classification and DB, with zero model calls. One function also gets an unused provisional type, which must be stored with its compiler-measured layout.
+- **Saboteur agent:** tries to edit `ctx.h` (including chmod first) and `target.s`, and to write and create files in the vanilla worktree. It must produce outcome `invalid`, and the vanilla worktree must be unchanged (git status clean, target objects byte-identical, writes denied).
+- `rematch selftest` runs on a copy of the DB in its own workdir, and every fake invocation is logged and counted.
 - CI-equivalent local command: `uv run pytest -q && uv run ruff check && uv run mypy src`.
 - Tests never invoke the real `claude` binary. `CLAUDE_BIN` is swapped for the fakes.
 - Type recovery: the offset/size probe (§16.1) against known layouts; the `type_merge` gate with a fake agent: a compatible merge is accepted and re-verifies every match at 100%; a merge that breaks one match is rejected and changes nothing.
@@ -663,7 +696,7 @@ Every command that can spend tokens (`attempt`, `bench`, `run`) prints an estima
 
 ## 15. Security and hygiene
 
-- Workers can only touch their sandbox. The vanilla worktree is read-only to workers (enforced by `chmod` on the vanilla tree after the build, plus sandbox hashing).
+- Workers can only touch their sandbox. `rematch doctor` makes the vanilla worktree read-only after its hashes pass (write permission is restored only for a rebuild), on top of sandbox hashing. Reads of answer-bearing places are denied by permission rules (§7.3).
 - The integrator is the only writer to the live worktree.
 - No network tools for workers (`--tools` excludes WebFetch and WebSearch; `--strict-mcp-config` with no config).
 - Secrets only in `.env`. Never log `ANTHROPIC_API_KEY`.
@@ -720,7 +753,8 @@ Rules:
 - Edit ONLY candidate.c (and optionally append to NOTES.md). Every other file
   is read-only; changing them invalidates the attempt.
 - After every meaningful edit, run ./check. It is the only judge. You are done
-  only when it prints "MATCH". Never claim a match yourself.
+  only when it prints "MATCH". Never claim a match yourself. Run it exactly as
+  `./check`, as a command on its own: every other shell command is denied.
 - No inline asm, no #pragma, no #include other than "ctx.h". No tricks whose
   only purpose is to fool the compiler (pointless volatile, goto, do/while(0),
   redundant casts). The code must read like plausible original source.

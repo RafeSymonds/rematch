@@ -6,6 +6,7 @@ import hashlib
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -243,6 +244,47 @@ def check_tool(name: str, argv: list[str], must_contain: str | None = None) -> C
     return CheckResult(name, True, version)
 
 
+_WRITE_BITS = stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+
+
+def set_writable(root: Path, writable: bool) -> int:
+    """Add or remove write permission on every file and directory under `root` (SPEC §15).
+
+    Returns how many entries changed. The vanilla worktree is the answer key: nothing but a
+    deliberate rebuild may write to it.
+    """
+    changed = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in [*filenames, *dirnames, ""]:
+            path = Path(dirpath) / name if name else Path(dirpath)
+            try:
+                mode = path.lstat().st_mode
+            except OSError:
+                continue
+            if stat.S_ISLNK(mode):
+                continue
+            new = (mode | stat.S_IWUSR) if writable else (mode & ~_WRITE_BITS)
+            if new != mode:
+                path.chmod(new)
+                changed += 1
+    return changed
+
+
+def check_vanilla_read_only(worktree: Path) -> CheckResult:
+    name = "vanilla read-only"
+    try:
+        changed = set_writable(worktree, writable=False)
+    except OSError as exc:
+        return CheckResult(name, False, f"{worktree}: {exc}")
+    probe = worktree / ".rematch_write_probe"
+    try:
+        probe.write_text("x")
+    except OSError:
+        return CheckResult(name, True, f"{worktree} ({changed} entries made read-only)")
+    probe.unlink(missing_ok=True)
+    return CheckResult(name, False, f"{worktree} is still writable")
+
+
 def sha1_file(path: Path) -> str:
     digest = hashlib.sha1()
     with path.open("rb") as handle:
@@ -256,6 +298,7 @@ def check_version(target: TomlTarget, worktree: Path, version: str, log: Log) ->
     rom = target.rom_path(worktree, version)
     if not rom.is_file():
         log(f"building {version} in {worktree} (ROM missing)")
+        set_writable(worktree, writable=True)  # a rebuild is the one deliberate write
         try:
             target.build(worktree, version)
         except (BuildError, OSError, subprocess.TimeoutExpired) as exc:
@@ -325,6 +368,7 @@ def iter_doctor(settings: Settings, log: Log = lambda _msg: None) -> Iterator[Ch
             for version in target.versions():
                 yield check_version(target, worktree, version, log)
             yield check_required_paths(worktree, definition.required_paths)
+            yield check_vanilla_read_only(worktree)
 
     yield check_tool("objdump", [settings.objdump, "--version"])
     yield check_tool("ctags", [settings.ctags, "--version"], must_contain="Universal Ctags")

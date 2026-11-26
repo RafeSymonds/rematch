@@ -51,7 +51,7 @@ Token spend starts in Phase 2.
 **Exit criteria**
 - [ ] `rematch selftest` passes: oracle 10/10 matches, saboteur produces `invalid`, vanilla tree unchanged, zero model calls
 - [ ] `rematch bench --n 100 --seed 42 --pool clean` runs unattended to completion
-- [ ] Baseline row recorded in `docs/benchmarks.md`: match rate, median checks, tokens and cost per match, wall time, all per size bucket
+- [ ] Baseline row recorded in the target's `.rematch/benchmarks.md`: match rate, median checks, tokens and cost per match, wall time, all per size bucket
 - [ ] A match whose candidate declares provisional types stores them with compiler-measured offsets and sizes (selftest fixture)
 - [ ] No target number is required. The point is an honest baseline.
 
@@ -70,7 +70,7 @@ Changes are made one at a time, each measured on the **same** frozen set (`b100-
 
 **Exit criteria**
 - [ ] On the frozen set, either match rate improves by ≥ 10 percentage points over baseline, or cost per match drops by ≥ 30% at an equal or better match rate
-- [ ] Ablation table in `docs/benchmarks.md` showing each change's isolated effect
+- [ ] Ablation table in the target's `.rematch/benchmarks.md` showing each change's isolated effect
 - [ ] A second frozen set (`b100-s7-…`) confirms the gain isn't overfit to set 42 (within ±5 points)
 
 ---

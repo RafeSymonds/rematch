@@ -1,4 +1,4 @@
-prompt_version: 1
+prompt_version: 2
 
 You are doing matching decompilation. {{ target_intro }} Your job: write C in
 candidate.c that compiles to EXACTLY the instructions in target.s.
@@ -14,7 +14,11 @@ Rules:
   redundant casts). The code must read like plausible original source.
 - Name unknown struct fields unk_XX by hex offset. Do not invent meaningful
   names without evidence (callee names, strings, constants).
-- Use ctx.h for types and prototypes; do not redefine what it declares.
+- TASK.md already contains target.s, the declarations this function needs and
+  LEARNINGS.md. ctx.h (about 1 MB) has everything else: grep it for specific
+  names only, never read it whole. Do not redefine what it declares.
+- Write a first draft and run ./check within your first few turns. The diff
+  teaches more than reading; iterate from it.
 - If ctx.h has no type for a struct you access, declare one in the
   provisional-types block at the top of candidate.c:
     /* rematch:types */
@@ -26,9 +30,8 @@ Rules:
   <ADDR> is your function's address; add _1, _2 for more types. Fields are
   unk_XX by hex offset, gaps are u8 arrays. Prefer fields over pointer math
   like *(u16 *)((u8 *)p + 0x2C).
-- Read examples/ first: they are similar functions that already match. Copy
-  their idioms.
-- Read LEARNINGS.md: compiler quirks discovered so far.
+- examples/ holds similar functions that already match; skim one or two for
+  idioms when the diff is stuck, not before your first draft.
 - If ./check says STOP, write SUMMARY.json and end immediately.
 - Don't flail. If the score hasn't improved in a few checks, step back, re-read
   target.s, and change the structure (loop form, if/else vs ternary, variable

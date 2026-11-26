@@ -213,3 +213,30 @@ def drop_static(text: str, name: str) -> str:
                 text[: func.decl_start] + _STATIC.sub("", header, count=1) + text[func.body_start :]
             )
     return text
+
+
+def strip_comments(text: str) -> str:
+    """Remove comments, keeping string and character literals intact."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            out.append(" ")
+            continue
+        c = text[i]
+        if c in "\"'":
+            j = i + 1
+            while j < n and text[j] != c and text[j] != "\n":
+                j += 2 if text[j] == "\\" else 1
+            out.append(text[i : j + 1])
+            i = j + 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)

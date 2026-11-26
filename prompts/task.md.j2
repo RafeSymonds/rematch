@@ -1,0 +1,13 @@
+# Task: match {{ symbol }} ({{ mode }}, {{ n_insns }} instructions, module {{ module }})
+
+Files:
+- target.s: the original assembly for {{ symbol }} (and its literal pool)
+- ctx.h: types, prototypes, constants
+- examples/: {{ examples|length }} similar functions with matching C
+{% if draft %}- draft.c: an automatic first draft (often wrong in details){% endif %}
+{% if previous_best %}- previous_best.c / previous_best.diff: best earlier attempt ({{ previous_best_score }}%){% endif %}
+
+Budget: at most {{ max_checks }} runs of ./check. Stop early if you match.
+{% if version_cond %}This function is checked against every target version.{% endif %}
+
+Write the function {{ symbol }} in candidate.c, run ./check, iterate to MATCH.

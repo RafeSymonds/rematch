@@ -15,6 +15,7 @@ import subprocess
 import time
 import tomllib
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -22,7 +23,13 @@ from pydantic import BaseModel, ConfigDict
 
 from rematch.session import Session
 from rematch.target.definition import target_dir
-from rematch.worker.sandbox import FunctionRecord, SandboxError, build_sandbox, find_function
+from rematch.worker.sandbox import (
+    FunctionRecord,
+    SandboxError,
+    SandboxOptions,
+    build_sandbox,
+    find_function,
+)
 
 GOLDEN_FILE = "golden.toml"
 Log = Callable[[str], None]
@@ -109,21 +116,29 @@ def _outcome(fn: str, seconds: float, data: dict[str, object]) -> Outcome:
     )
 
 
-def roundtrip(s: Session, fns: list[FunctionRecord], root: Path, log: Log) -> list[Outcome]:
-    outcomes: list[Outcome] = []
-    for i, fn in enumerate(fns):
-        sandbox = root / f"{i:03d}_{fn.name}"
-        try:
-            build_sandbox(s, fn, sandbox, with_source=True)
-        except SandboxError as exc:
-            outcomes.append(Outcome(fn.name, "error", 0.0, detail=[str(exc)]))
-            continue
-        seconds, data = _run_check(sandbox)
-        out = _outcome(fn.name, seconds, data)
-        out.ok = out.status == "match"
-        outcomes.append(out)
+def roundtrip_one(s: Session, fn: FunctionRecord, sandbox: Path) -> Outcome:
+    """Build a sandbox seeded with the human C and run the real ./check once."""
+    try:
+        build_sandbox(s, fn, sandbox, SandboxOptions(with_source=True))
+    except SandboxError as exc:
+        return Outcome(fn.name, "error", 0.0, detail=[str(exc)])
+    seconds, data = _run_check(sandbox)
+    out = _outcome(fn.name, seconds, data)
+    out.ok = out.status == "match"
+    return out
+
+
+def roundtrip(
+    s: Session, fns: list[FunctionRecord], root: Path, log: Log, workers: int = 1
+) -> list[Outcome]:
+    def one(item: tuple[int, FunctionRecord]) -> Outcome:
+        i, fn = item
+        out = roundtrip_one(s, fn, root / f"{i:03d}_{fn.name}")
         log(f"{i + 1}/{len(fns)} {fn.name}: {out.status} ({out.seconds:.2f}s)")
-    return outcomes
+        return out
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        return list(pool.map(one, enumerate(fns)))
 
 
 def run_mutants(
@@ -133,7 +148,7 @@ def run_mutants(
     for i, mutant in enumerate(mutants):
         fn = find_function(conn, mutant.function)
         sandbox = root / f"m{i:02d}_{fn.name}"
-        build_sandbox(s, fn, sandbox, with_source=True)
+        build_sandbox(s, fn, sandbox, SandboxOptions(with_source=True))
         candidate = (sandbox / "candidate.c").read_text(encoding="utf-8")
         if mutant.find not in candidate:
             outcomes.append(

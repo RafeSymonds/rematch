@@ -5,6 +5,7 @@ description = "Agent harness for matching decompilation with headless Claude Cod
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "jinja2>=3.1.6",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "pyelftools>=0.33",

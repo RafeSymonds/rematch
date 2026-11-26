@@ -507,7 +507,7 @@ rematch selftest                    # oracle + saboteur agents, zero tokens (§1
 rematch cd --sandbox DIR [--json-out F] [--mode isolated|tu]   # used by ./check
 rematch ctx FUNCTION --out DIR      # build a sandbox without running a worker (debugging)
 rematch attempt FUNCTION [--model M --effort E]                # one live attempt
-rematch bench --n N --seed S [--pool clean] [--workers W]
+rematch bench --n N --seed S [--pool clean] [--workers W] [--model M --effort E]
 rematch run --workers W [--max-attempts K] [--until HH:MM]     # live loop
 rematch integrate [--tu TU | --ready | --verify-branch]        # --verify-branch: rebuild every rematch/live commit, check hashes
 rematch report [--run ID | --last] [--compare ID]
@@ -517,6 +517,8 @@ rematch sync-upstream
 ```
 
 `rematch doctor` prints one `PASS`/`FAIL` line per check and exits 1 if any check fails. Checks, in order: `CLAUDE_BIN --version` ≥ 2.1.259 (spends no tokens); `REMATCH_WORKDIR` and ancestors clean (§4); `target.toml` valid (§2.1); no push URL in `TARGET_REPO` matches `forbidden_push_urls` and the installed pre-push hook matches `.rematch/pre-push` (§2.3); vanilla worktree at the pin (§6.2); `TOOLCHAIN_EXEC` runs `true` (if set); per-version build and hash (§6.2); `required_paths` present; DB migrated (§5).
+
+Model and effort: `attempt` and `bench` use `--model`/`--effort` if given, else `WORKER_MODEL`/`WORKER_EFFORT`. `run` starts each function at rung 0 of `ESCALATION_LADDER` and escalates through it (§8.4). The resolved model and effort are stored on every attempt.
 
 Every command that can spend tokens (`attempt`, `bench`, `run`) prints an estimate of attempts and requires `--yes`, or an interactive confirmation when attached to a TTY.
 

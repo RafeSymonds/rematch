@@ -70,15 +70,29 @@ class SourceSection(_Section):
 class LinkOrderSection(_Section):
     file: str
     format: Literal["nitro-lsf"]
+    # Older names of the link-order file, tried in order at commits where `file` is missing
+    # (history, §11.1). They may list objects (`x.o`) instead of sources.
+    history: list[str] = []
 
     @field_validator("file")
     @classmethod
     def _relative(cls, value: str) -> str:
         return _check_relative(value)
 
+    @field_validator("history")
+    @classmethod
+    def _relative_all(cls, value: list[str]) -> list[str]:
+        return [_check_relative(v) for v in value]
+
 
 class AsmSection(_Section):
     format: Literal["pret-macros"]
+    # Version whose addresses the assembly's address comments use (history, §11.1).
+    address_version: str | None = None
+
+
+class WorkerSection(_Section):
+    intro: str = ""  # target sentence for the worker system prompt (Appendix A {{ target_intro }})
 
 
 class ContextSection(_Section):
@@ -110,6 +124,7 @@ class TargetDef(BaseModel):
     asm: AsmSection | None = None
     context: ContextSection | None = None
     naming: NamingSection = NamingSection()
+    worker: WorkerSection = WorkerSection()
 
     @field_validator("required_paths")
     @classmethod

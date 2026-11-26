@@ -338,18 +338,21 @@ def bench(
     finally:
         conn.close()
     m, e = _model_effort(model, effort)
+    effort_for = {} if effort else _effort_by_size(s, [fn.id for fn in fns])
     _confirm_spend(f"bench {sid}", len(fns), yes)
     result = run_functions(
         s,
         "bench",
         fns,
         model=m,
-        effort=e,
+        effort="by-size" if effort_for else e,
         workers=workers or s.settings.worker_count,
         bench=True,
         seed=seed,
         log=_echo_err,
         bench_set=sid,
+        effort_for=effort_for,
+        extra_config={"effort_by_size": s.settings.effort_by_size if effort_for else None},
     )
     conn = store.connect(s.db_path)
     try:
@@ -411,3 +414,20 @@ def report(
             typer.echo(format_report(run_metrics(conn, compare)))
     finally:
         conn.close()
+
+
+def _effort_by_size(s: Session, ids: list[int]) -> dict[int, str]:
+    """EFFORT_BY_SIZE applied per function (empty setting: no per-size effort)."""
+    from rematch.bench.sets import bucket
+
+    if not s.settings.effort_by_size:
+        return {}
+    conn = store.connect(s.db_path)
+    try:
+        marks = ",".join("?" * len(ids))
+        rows = conn.execute(
+            f"SELECT id, n_insns FROM functions WHERE id IN ({marks})", ids
+        ).fetchall()
+    finally:
+        conn.close()
+    return {int(fid): s.settings.effort_for_size(bucket(int(n or 0))) for fid, n in rows}

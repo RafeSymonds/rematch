@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     anthropic_api_key: SecretStr = SecretStr("")
     worker_model: str = "sonnet"
     worker_effort: str = "high"
+    # Effort per size bucket (S/M/L, SPEC §11.2) when --effort isn't given; empty = WORKER_EFFORT.
+    effort_by_size: str = "S:medium,M:high,L:high"
     escalation_ladder: str = "sonnet:high,sonnet:xhigh,opus:high,opus:xhigh"
     max_turns: int = Field(default=60, ge=1)
     max_checks: int = Field(default=40, ge=1)
@@ -59,6 +61,10 @@ class Settings(BaseSettings):
     def _expand_user(cls, value: Path | None) -> Path | None:
         # Absolute from here on: these paths are handed to processes running in sandboxes.
         return None if value is None else value.expanduser().resolve()
+
+    def effort_for_size(self, size_bucket: str) -> str:
+        table = dict(part.split(":", 1) for part in self.effort_by_size.split(",") if ":" in part)
+        return table.get(size_bucket, self.worker_effort)
 
     def version_override(self) -> list[str]:
         """`TARGET_VERSIONS` as a list. Empty means use target.toml `default_versions`."""

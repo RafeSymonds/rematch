@@ -1,0 +1,8 @@
+#!/bin/sh
+# Fake Claude Code for tests. Never spends tokens.
+if [ "$1" = "--version" ]; then
+  echo "${FAKE_CLAUDE_VERSION:-2.1.300} (Claude Code)"
+  exit 0
+fi
+echo "fake claude: unsupported args: $*" >&2
+exit 2

@@ -41,6 +41,8 @@ class Settings(BaseSettings):
     max_attempts_per_function: int = Field(default=4, ge=1)
     retry_cooldown_min: int = Field(default=240, ge=0)
     examples_k: int = Field(default=3, ge=0)
+    # After a run, suggest `rematch learnings curate` once this many candidates are pending.
+    curate_pending_threshold: int = Field(default=50, ge=1)
     examples_mode: Literal["naive", "similar"] = "similar"  # SPEC §6.7; naive = Phase 2 baseline
     reference_repos: str = ""
     diff_backend: Literal["objdiff", "objdump"] = "objdump"

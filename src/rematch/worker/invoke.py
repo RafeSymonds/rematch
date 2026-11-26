@@ -48,6 +48,7 @@ class InvokeConfig:
     system_prompt_file: Path
     deny_read_roots: tuple[Path, ...]
     api_key: str = ""
+    allowed_tools: tuple[str, ...] = ()  # default: ALLOWED_TOOLS (the decompilation worker)
 
 
 @dataclass
@@ -102,7 +103,7 @@ def worker_argv(cfg: InvokeConfig, prompt: str, resume: str | None = None) -> li
         "--tools",
         "Read,Edit,Write,Bash",
         "--allowedTools",
-        *ALLOWED_TOOLS,
+        *(cfg.allowed_tools or ALLOWED_TOOLS),
         "--disallowedTools",
         *(deny_rule(p) for p in cfg.deny_read_roots),
         "--permission-mode",

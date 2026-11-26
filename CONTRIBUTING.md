@@ -36,8 +36,9 @@ rematch is built with coding agents. This file covers the workflow for humans an
 ## Learnings curation
 
 - Workers propose learnings in `NOTES.md`. They land in `learning_candidates`.
-- Review with `rematch learnings review`. Accept only rules that are general (not about one function), true for this compiler and flags, and not already covered.
-- Keep `docs/LEARNINGS.md` under about 150 lines. Merge and prune when it grows. Every accepted rule should carry an example (one line of C and the effect it has on codegen).
+- Curate with `rematch learnings curate --yes` (an agent that must prove each rule with an evidence pair that rematch recompiles) or by hand with `rematch learnings review`. Accept only rules that are general (not about one function), true for this compiler and flags, and not already covered.
+- `docs/learnings/<compiler>.json` holds compiler rules only. Anything that names a target's functions, types or files belongs in that target's `.rematch/learnings.json`, and curation moves such rules automatically.
+- Keep each scope under 150 rules. `rematch learnings verify --retire` removes rules whose evidence no longer holds.
 
 ## Review checklist (for agent-written changes)
 

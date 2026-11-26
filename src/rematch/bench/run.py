@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 from rematch.context.examples import naive_examples, similar_examples
 from rematch.db import store
+from rematch.learnings.curate_run import ensure_verified, pending_count
 from rematch.session import Session
 from rematch.worker.attempt import (
     REMATCH_ROOT,
@@ -69,6 +70,7 @@ def run_functions(
     effort_for: dict[int, str] | None = None,
 ) -> RunResult:
     effort_for = effort_for or {}
+    learnings = ensure_verified(s, log)
     conn = store.connect(s.db_path)
     try:
         config = run_config(
@@ -79,6 +81,7 @@ def run_functions(
                 "kind": kind,
                 "seed": seed,
                 "examples_mode": s.settings.examples_mode,
+                "learnings_sha256": learnings,
                 **(extra_config or {}),
             },
         )
@@ -122,8 +125,11 @@ def run_functions(
     conn = store.connect(s.db_path)
     try:
         finish_run(conn, run_id)
+        waiting = pending_count(conn)
     finally:
         conn.close()
+    if waiting >= s.settings.curate_pending_threshold:
+        log(f"{waiting} learning candidates pending: run `rematch learnings curate --yes`")
     return RunResult(run_id, results)
 
 

@@ -20,15 +20,13 @@ from rematch.diff.match import function_view
 from rematch.diff.objdump_backend import Line, disassemble, run_objdump
 from rematch.inventory import asm_parser, link_order
 from rematch.inventory.c_parser import function_source, strip_comments, tu_local_context
-from rematch.learnings.curate import combined
+from rematch.learnings.rules import compiler_file, sandbox_text, target_file
 from rematch.session import Session
 from rematch.target.definition import target_dir
 from rematch.toolchain.compile_db import CompileDB, CompileEntry
 from rematch.toolchain.objects import ObjectFile, read_object
 from rematch.worker.check_entry import save_target
 from rematch.worker.task import CompileSpec, Task, VersionTask
-
-LEARNINGS = Path(__file__).resolve().parents[3] / "docs" / "LEARNINGS.md"
 
 
 class SandboxError(Exception):
@@ -326,7 +324,12 @@ def build_sandbox(
     check.chmod(0o755)
 
     example_names = write_examples(s, opts.examples, out)
-    learnings = combined(LEARNINGS, target_dir(s.settings.target_repo) / "LEARNINGS.md")
+    learnings = sandbox_text(
+        [
+            compiler_file(s.definition.worker.compiler or "default"),
+            target_file(target_dir(s.settings.target_repo)),
+        ]
+    )
     (out / "LEARNINGS.md").write_text(learnings, encoding="utf-8")
     if opts.task_md:
         (out / "TASK.md").write_text(

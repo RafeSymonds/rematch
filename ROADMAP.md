@@ -61,7 +61,7 @@ Token spend starts in Phase 2.
 
 Changes are made one at a time, each measured on the **same** frozen set (`b100-s42-c20260701`) against the baseline:
 - similarity-ranked examples (in-repo)
-- curated `LEARNINGS.md` plus the `learnings review` flow
+- curated learnings: `learnings review` (human) and `learnings curate` (agent with evidence that rematch recompiles), compiler and target scopes, `learnings verify` before every run
 - m2c draft seeding (`draft.c`)
 - cross-repo examples from `REFERENCE_REPOS` (related decomp repos; build them once; opcode-feature index)
 - prompt iterations (bump `prompt_version` every time)

@@ -95,6 +95,8 @@ address_version = "us"                     # version whose addresses the assembl
 
 [worker]
 intro = "The target is ... compiled with ..., Thumb mode unless target.s says otherwise."   # Appendix A {{ target_intro }}
+compiler = "mwcc-arm"        # compiler family: shares docs/learnings/<compiler>.json with other targets (§13.1)
+trial_header = "trial.h"     # optional, in .rematch/: the evidence header (typedefs + mode pragmas)
 ```
 
 ### 2.1.3 Phase 4 fields
@@ -150,7 +152,7 @@ rematch/
     integrate/tu_builder.py  integrate/lsf.py  integrate/verify.py
     bench/pool.py  bench/sets.py  bench/report.py
     lint/readability.py
-    learnings/candidates.py  learnings/curate.py
+    learnings/curate.py  learnings/rules.py  learnings/trial.py  learnings/curate_run.py   # §13.1
     types/provisional.py  types/probe.py  types/merge.py  types/reference.py   # §16
     naming/propose.py                                                          # §16.5
     selftest/oracle_agent.py  selftest/saboteur_agent.py
@@ -158,9 +160,9 @@ rematch/
     worker_system.md             # Appendix A (versioned: header line `prompt_version: N`)
     task.md.j2                   # Appendix B
     tu_data_task.md.j2
-    curate.md
+    curate.md  curate/types.h    # §13.1 curation agent and its default evidence header
   docs/
-    LEARNINGS.md                 # curated compiler quirks, injected into sandboxes
+    learnings/<compiler>.json    # compiler-scope rules (§13.1); .md alongside is generated
     verify-log.md                # evidence for resolved rematch VERIFY items
   tests/
   var/                           # gitignored: db, logs, bench sets (sandboxes live in REMATCH_WORKDIR, outside the repo)
@@ -200,6 +202,7 @@ This repo is target-agnostic: no game names, target paths, host names or persona
 | `MAX_ATTEMPTS_PER_FUNCTION` | `4` | Before status `stuck` |
 | `RETRY_COOLDOWN_MIN` | `240` | |
 | `EXAMPLES_K` | `3` | Similar matched functions per sandbox |
+| `CURATE_PENDING_THRESHOLD` | `50` | After a run, suggest `learnings curate` once this many candidates are pending |
 | `REFERENCE_REPOS` | (empty) | Comma-separated paths to related decomp repos (same engine or compiler) for cross-repo examples (Phase 3) |
 | `DIFF_BACKEND` | `objdump` | `objdump` or `objdiff` (§6.5) |
 | `OBJDIFF_BIN` | `objdiff-cli` | |
@@ -486,7 +489,7 @@ $REMATCH_WORKDIR/attempts/<attempt_id>/
   ctx.h            # §6.3
   examples/        # §6.7
   draft.c          # optional m2c draft (Phase 3)
-  LEARNINGS.md     # copy of docs/LEARNINGS.md
+  LEARNINGS.md     # compiler-scope then target-scope rules (§13.1)
   candidate.c      # starts as draft.c or a stub with the right signature if known
   check            # executable wrapper → rematch cd (§6.4)
   ctx.<version>.h  # context for each extra version of a version-conditional TU
@@ -674,11 +677,31 @@ rematch run --workers W [--max-attempts K] [--until HH:MM]     # live loop
 rematch integrate [--tu TU | --ready | --verify-branch]        # --verify-branch: rebuild every rematch/live commit, check hashes
 rematch report [--run ID | --last] [--compare ID]
 rematch stuck --list | --show FUNCTION
-rematch learnings review            # interactive accept/reject of candidates
+rematch learnings review            # human accept/reject of candidates (rules without evidence)
+rematch learnings curate --yes      # agent curation; rematch verifies evidence before applying (§13.1)
+rematch learnings verify [--retire] # re-run every rule's evidence (no tokens)
+rematch try A.c B.c --control DIR   # the curation agent's ./try
 rematch types list | show NAME | merge [--cluster ID] [--tu TU]   # type recovery (§16.2)
 rematch names review                # interactive accept/reject of name proposals (§16.5)
 rematch sync-upstream
 ```
+
+### 13.1 Learnings
+
+Workers propose candidates in `NOTES.md` (`learning_candidates`). Accepted candidates become rules in one of two JSON files, each with a generated `.md` beside it:
+
+- compiler scope: `docs/learnings/<compiler>.json` in rematch, public and target-agnostic, shared by every target whose `[worker] compiler` names it
+- target scope: `<TARGET_REPO>/.rematch/learnings.json`
+
+A sandbox's `LEARNINGS.md` is both files' rules, compiler first. Each scope stays under 150 rules.
+
+`learnings curate` runs an agent in its own sandbox (CANDIDATES.md, RULES.md, `types.h`, `evidence/`, `./try`; tools limited to those files). For each candidate it decides accept, merge or reject, and it may rewrite or retire rules. An accepted rule must come with an evidence pair: two snippets that include only `types.h` (the target's `trial_header`, else `prompts/curate/types.h`) plus a regex `expect`. rematch then applies the decisions only after its own checks:
+
+1. It recompiles every accepted pair with the target's most common C compile flags. The rule is dropped unless both compile, their code differs, and a differing line matches `expect`.
+2. A compiler-scope rule whose text or evidence names a target identifier (inventory function names, header-index declarations) moves to target scope.
+3. Candidates are marked accepted or rejected.
+
+`learnings verify` recompiles every rule's evidence. Before each run, `ensure_verified` does the same, cached by a digest of the rules, the trial header and the pin, and the run aborts if any rule fails. The digest is recorded as `learnings_sha256` in the run config. Rules accepted by hand through `learnings review` carry no evidence and are reported as SKIP. After a run with at least `CURATE_PENDING_THRESHOLD` candidates pending, rematch suggests a curation pass. It never spends tokens on curation by itself.
 
 `rematch doctor` prints one `PASS`/`FAIL` line per check and exits 1 if any check fails. Checks, in order: `CLAUDE_BIN --version` ≥ 2.1.259 (spends no tokens); `REMATCH_WORKDIR` and ancestors clean (§4); `target.toml` valid (§2.1); no push URL in `TARGET_REPO` matches `forbidden_push_urls` and the installed pre-push hook matches `.rematch/pre-push` (§2.3); vanilla worktree at the pin (§6.2); `TOOLCHAIN_EXEC` runs `true` (if set); the toolchain sees `REMATCH_WORKDIR` (sandboxes are compiled through it); per-version build and hash (§6.2); `required_paths` present; `OBJDUMP` runs; `CTAGS` is Universal Ctags; DB migrated (§5).
 

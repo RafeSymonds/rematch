@@ -441,20 +441,21 @@ app.add_typer(learnings_app, name="learnings")
 def learnings_review(
     list_only: bool = typer.Option(False, "--list", help="Print pending candidates and exit."),
     accept: list[int] = typer.Option([], "--accept", help="Candidate ids to accept."),
-    to: str = typer.Option("generic", "--to", help="generic (rematch) or target (.rematch/)."),
+    to: str = typer.Option("compiler", "--to", help="compiler (rematch) or target (.rematch/)."),
     reject: list[int] = typer.Option([], "--reject", help="Candidate ids to reject."),
 ) -> None:
-    """Accept or reject learning candidates; accepted ones go into a LEARNINGS.md."""
+    """Accept or reject learning candidates by hand; accepted ones become rules (no evidence)."""
     import sys
 
-    from rematch.learnings.curate import MAX_LINES, append_rule, decide, line_count, pending
-    from rematch.target.definition import target_dir
-    from rematch.worker.sandbox import LEARNINGS
+    from rematch.learnings.curate import decide, pending
+    from rematch.learnings.curate_run import rule_files
+    from rematch.learnings.rules import MAX_LINES, Rule
 
     s = _session()
-    files = {"generic": LEARNINGS, "target": target_dir(s.settings.target_repo) / "LEARNINGS.md"}
+    comp, tgt = rule_files(s)
+    files = {"compiler": comp, "target": tgt}
     if to not in files:
-        typer.echo("--to must be generic or target")
+        typer.echo("--to must be compiler or target")
         raise typer.Exit(2)
     conn = store.connect(s.db_path)
     try:
@@ -470,23 +471,97 @@ def learnings_review(
         if not decisions and sys.stdin.isatty():
             for cid, text in todo.items():
                 typer.echo(f"\n[{cid}] {text}")
-                choice = typer.prompt("g=generic t=target r=reject s=skip q=quit", default="s")
+                choice = typer.prompt("c=compiler t=target r=reject s=skip q=quit", default="s")
                 if choice == "q":
                     break
-                if choice in ("g", "t", "r"):
-                    decisions.append((cid, {"g": "generic", "t": "target"}.get(choice)))
+                if choice in ("c", "t", "r"):
+                    decisions.append((cid, {"c": "compiler", "t": "target"}.get(choice)))
         for cid, dest in decisions:
             if cid not in todo:
                 typer.echo(f"{cid}: not pending; skipped")
                 continue
             if dest is not None:
-                added = append_rule(files[dest], todo[cid])
-                typer.echo(f"{cid}: {'added to' if added else 'already in'} {files[dest]}")
+                f = files[dest]
+                text = " ".join(todo[cid].split())
+                if any(r.text == text for r in f.rules):
+                    typer.echo(f"{cid}: already in {f.path.name}")
+                else:
+                    rid = f.next_id("T" if dest == "target" else "C")
+                    f.rules.append(Rule(rid, text, None, [cid]))  # no evidence: unverified
+                    typer.echo(f"{cid}: added as {rid} to {f.path}")
             decide(conn, cid, accept=dest is not None)
     finally:
         conn.close()
-    for name, path in files.items():
-        if line_count(path) > MAX_LINES:
-            typer.echo(
-                f"warning: {name} LEARNINGS.md has {line_count(path)} lines (cap {MAX_LINES})"
-            )
+    for name, f in files.items():
+        f.save()
+        if len(f.rules) > MAX_LINES:
+            typer.echo(f"warning: {name} has {len(f.rules)} rules (cap {MAX_LINES})")
+
+
+@app.command("try")
+def try_cmd(
+    a: Path = typer.Argument(..., help="First C snippet."),
+    b: Path = typer.Argument(..., help="Second C snippet."),
+    control: Path = typer.Option(..., help="Control dir with trial.json."),
+) -> None:
+    """Compile two snippets with the target's compiler and show how their code differs."""
+    from rematch.learnings.trial import Compiler, run_trial
+    from rematch.toolchain.runner import ToolchainRunner
+    from rematch.worker.task import CompileSpec
+
+    cfg = json.loads((control / "trial.json").read_text(encoding="utf-8"))
+    compiler = Compiler(
+        CompileSpec(**cfg["compile"]).entry(),
+        ToolchainRunner.from_spec(cfg["toolchain_exec"]),
+        cfg["objdump"],
+        float(cfg["timeout"]),
+        cfg["header"],
+    )
+    trial = run_trial(
+        compiler, a.read_text(encoding="utf-8"), b.read_text(encoding="utf-8"), control / "try"
+    )
+    typer.echo(trial.report())
+    raise typer.Exit(0 if trial.ok else 1)
+
+
+@learnings_app.command("curate")
+def learnings_curate(
+    batch: int = typer.Option(40, help="Candidates per curation run."),
+    model: str | None = typer.Option(None),
+    effort: str = typer.Option("medium"),
+    yes: bool = typer.Option(False, "--yes", help="Confirm token spend."),
+) -> None:
+    """An agent curates pending candidates; rematch verifies its evidence before applying."""
+    from rematch.learnings.curate_run import run_curation
+
+    s = _session()
+    _confirm_spend("learnings curate", 1, yes)
+    conn = store.connect(s.db_path)
+    try:
+        applied, cost = run_curation(
+            s, conn, batch, model or s.settings.worker_model, effort, _echo_err
+        )
+    finally:
+        conn.close()
+    typer.echo(f"accepted {applied.accepted}")
+    typer.echo(f"dropped by the evidence check {applied.dropped}")
+    typer.echo(f"merged {applied.merged}; rejected {len(applied.rejected)}")
+    typer.echo(f"rewritten {applied.rewritten}; retired {applied.retired}")
+    if applied.moved_to_target:
+        typer.echo(f"moved to target scope (named target code): {applied.moved_to_target}")
+    typer.echo(f"cost ${cost:.3f} (estimate)")
+
+
+@learnings_app.command("verify")
+def learnings_verify(
+    retire: bool = typer.Option(False, help="Remove rules whose evidence no longer holds."),
+) -> None:
+    """Re-run every rule's evidence with the target compiler (no tokens)."""
+    from rematch.learnings.curate_run import verify_all
+
+    s = _session()
+    results = verify_all(s, retire, _echo_err)
+    for rid, ok, why in results:
+        typer.echo(f"{'SKIP' if ok is None else 'PASS' if ok else 'FAIL'} {rid}: {why}")
+    if any(ok is False for _, ok, _ in results):
+        raise typer.Exit(1)

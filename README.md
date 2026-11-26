@@ -10,7 +10,11 @@ rematch works on matching-decompilation projects: repos whose build reproduces t
 
 ## What it does
 
+![How rematch works: doctor, inventory, scheduler, worker sandbox, re-verify, integrate](docs/diagrams/overview.svg)
+
 Every unmatched function becomes a small, sandboxed task. A worker (`claude -p`) gets the target assembly, the header context, a few similar already-matched functions, and one tool: `./check`. That tool compiles the candidate C with the target's original compiler (same flags as the real build) and diffs the result instruction by instruction against the original. The worker iterates until the diff is empty.
+
+![One attempt: the worker edits candidate.c, ./check compiles and diffs it, and the orchestrator re-verifies a match](docs/diagrams/worker-loop.svg)
 
 The orchestrator schedules work, records every attempt in SQLite, and verifies matches independently. Once every function in an assembly translation unit (TU) matches, it integrates that TU into the target repo, rebuilds every version, and checks the hashes.
 
@@ -66,3 +70,4 @@ Commands after `doctor` arrive phase by phase (ROADMAP.md).
 | `AGENTS.md` | Rules and traps for coding agents working on this repo |
 | `CLAUDE.md` | Claude Code–specific notes (imports AGENTS.md) |
 | `CONTRIBUTING.md` | Workflow, prompt versioning, benchmark hygiene |
+| `docs/diagrams/` | README diagrams. Edit the `.excalidraw` source, then re-export the `.svg` |

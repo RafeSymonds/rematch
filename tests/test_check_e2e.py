@@ -122,3 +122,9 @@ def test_stagnation_stops(tmp_path: Path) -> None:
     assert code == EXIT_NO_MATCH
     text, code = check(sandbox, "int Target(int n) { return n; }")
     assert code == EXIT_STOP and "no new best score in 2 checks" in text
+
+
+def test_candidate_including_ctx_matches(tmp_path: Path) -> None:
+    sandbox = make_sandbox(tmp_path)
+    text, code = check(sandbox, '#include "ctx.h"\n' + ORIGINAL.split("\n", 1)[1])
+    assert code == EXIT_MATCH, text

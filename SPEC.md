@@ -404,7 +404,7 @@ Invocation inside a sandbox: `./check` (no arguments). It runs `rematch cd --san
 
 Steps:
 1. Read `candidate.c`. Reject immediately (status `rejected`, no compile; this counts as a check) if it contains (outside comments and string literals): `asm`, `__asm`, any `#pragma`, an `#include` of anything except `"ctx.h"`, no definition of the target function, or more than one. From Phase 2, also reject a provisional-types block (§16.1) that is not at the top, appears twice, contains anything but type declarations, or redefines a name ctx.h declares.
-2. Write scratch TU `scratch.<version>.c` = `#include "<ctx>"\n#line 1 "candidate.c"\n` + candidate. If the candidate defines the target `static`, append `void *const rematch_keep_<symbol> = (void *)<symbol>;`: nothing references the function in isolation, so the compiler would not emit it. The worker never sees this line.
+2. Write scratch TU `scratch.<version>.c` = `#include "<ctx>"\n#line 1 "candidate.c"\n` + candidate, with the candidate's own `#include "ctx.h"` lines (allowed, and common) blanked in place, since the scratch file already includes the context. If the candidate defines the target `static`, append `void *const rematch_keep_<symbol> = (void *)<symbol>;`: nothing references the function in isolation, so the compiler would not emit it. The worker never sees this line.
 3. **Isolated mode (default):** compile the scratch TU with the exact argv from the vanilla build's `compile_commands.json` entry for the TU (for an assembly TU: the first C entry with the same output directory), with only the source and output swapped, cwd = the entry's `directory`, through `TOOLCHAIN_EXEC`. Timeout `COMPILE_TIMEOUT_SEC`.
    - Context for a human-C target (bench, round-trip) = the flattened headers of the TU's `#include` lines, plus the TU's own declarations: its text without `#include` lines and without the target's definition, with `inline` bodies kept and every other body turned into a prototype. Other functions' `static` prototypes lose `static`, because mwcc rejects a call to a static function it never sees defined.
    - Context for an assembly target = the flattened base header plus the headers declaring its callees (header index).
@@ -514,7 +514,7 @@ claude -p "$(cat TASK.md)" \
   --append-system-prompt-file "$VAR/runs/<run>/worker_system.md" \
   --tools "Read,Edit,Write,Bash" \
   --allowedTools "Read" "Edit(candidate.c)" "Write(candidate.c)" "Edit(NOTES.md)" \
-                 "Write(NOTES.md)" "Write(SUMMARY.json)" "Bash(./check)" \
+                 "Write(NOTES.md)" "Edit(SUMMARY.json)" "Write(SUMMARY.json)" "Bash(./check)" \
   --disallowedTools "Read(task.json)" "Read(.target/**)" "Read(//<deny root>/**)" ... \
   --permission-mode dontAsk --permission-prompts none \
   --setting-sources project,local \
@@ -529,7 +529,9 @@ Deny roots (reads denied): `TARGET_REPO`, the vanilla worktree, the rematch repo
 **API mode:** the same command plus `--bare` and `--max-budget-usd "$MAX_BUDGET_USD_PER_ATTEMPT"`, with `ANTHROPIC_API_KEY` set. Bare mode doesn't use subscription login. In subscription mode `ANTHROPIC_API_KEY` is removed from the worker's environment, so no attempt bills an API key by accident.
 
 Probe results (2026-11-26):
-- Reads are allowed **anywhere** by default, including outside the sandbox. The deny rules above block them ("File is in a directory that is denied by your permission settings"). Without them a bench worker could read the human C. Writes outside the allowed files, and any Bash command other than exactly `./check` (including `./check; echo`), are denied.
+- Reads are allowed **anywhere** by default, including outside the sandbox. The deny rules above block them ("File is in a directory that is denied by your permission settings"). Without them a bench worker could read the human C. Writes outside the allowed files are denied.
+- Bash: `./check` is allowed. Claude Code also auto-approves *read-only* commands (`ls`, `cat`, …) inside the working directory, and checks their paths against the Read deny rules (`cat task.json` was denied in the smoke bench). Commands outside the sandbox (`ls /`), compound commands such as `./check; echo`, and anything that writes are denied. In-sandbox reads are harmless, so this is accepted.
+- File writes are governed by `Edit(path)` rules: `Write(SUMMARY.json)` alone was denied in the smoke benches, so every writable file gets an `Edit(...)` rule. The builder also creates `SUMMARY.json` (`{}`) and `NOTES.md` (empty) up front.
 - `--setting-sources project,local` keeps the subscription login and drops user settings: output style, user agents, user plugins and hooks. `--disable-slash-commands` and `--strict-mcp-config` leave no skills and no MCP servers.
 - **Known confound:** the user-level `~/.claude/CLAUDE.md` still loads in subscription mode (memory isn't a setting source). Avoiding it requires API mode (`--bare`) or a dedicated `CLAUDE_CONFIG_DIR` with its own login. Benchmark rows note which one applied.
 - `--max-turns` still works in 2.1.332, although `--help` no longer lists it (result subtype `error_max_turns`). `--effort` is accepted.
@@ -710,7 +712,7 @@ Workers match one function at a time, but most unmatched functions use structs t
 ### 16.1 Provisional types (Phase 2)
 
 - A worker that needs a type ctx.h lacks declares it in one block at the top of `candidate.c`, between `/* rematch:types */` and `/* rematch:end-types */` (prompt rule, Appendix A). The block holds only struct, union, enum and typedef declarations.
-- Names: `UnkStruct_<ADDR>` (or `UnkUnion_<ADDR>`), where `<ADDR>` is the target function's address in 8 hex digits, with `_1`, `_2` suffixes for several. Fields are `unk_XX` by hex offset. Gaps are `u8 unk_XX[N]` padding. The block may not redefine a name ctx.h declares (pre-filter, §6.4).
+- Names: `UnkStruct_<ADDR>` (or `UnkUnion_<ADDR>`), where `<ADDR>` is the target function's address in 8 hex digits, with `_1`, `_2` suffixes for several. Fields are `unk_XX` by hex offset, optionally with a suffix for bitfields or split fields (`unk_58_0`). Gaps are `u8 unk_XX[N]` padding. The block may not redefine a name ctx.h declares (pre-filter, §6.4).
 - Offsets and sizes are measured, not parsed: on a match, `cd` compiles a probe that stores `sizeof` and every field's `offsetof` and size in a data object, and reads the values back from the object. The names are only a convention, and the compiler is the authority on layout.
 - On `match`, the block's types are stored in `provisional_types` with their measured layout and a canonical signature (`offset:size,...`). The block stays in `matches.c_source`.
 

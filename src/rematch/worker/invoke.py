@@ -29,6 +29,7 @@ ALLOWED_TOOLS = (
     "Write(candidate.c)",
     "Edit(NOTES.md)",
     "Write(NOTES.md)",
+    "Edit(SUMMARY.json)",  # Edit(...) rules govern the Write tool too; Write(...) alone was denied
     "Write(SUMMARY.json)",
     "Bash(./check)",
 )

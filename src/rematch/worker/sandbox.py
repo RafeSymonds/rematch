@@ -248,6 +248,9 @@ def build_sandbox(
         candidate = f"// Write {symbol} here. Its prototype, if known, is in ctx.h.\n"
     (out / "candidate.c").write_text(candidate, encoding="utf-8")
     (out / "NOTES.md").write_text("", encoding="utf-8")
+    # Claude Code denies Write on a file that doesn't exist yet even when the path is allowed,
+    # so the worker's report file exists from the start.
+    (out / "SUMMARY.json").write_text("{}\n", encoding="utf-8")
     check = out / "check"
     check.write_text(check_script(), encoding="utf-8")
     check.chmod(0o755)

@@ -160,6 +160,7 @@ def test_provisional_block_parses() -> None:
         ("unk_08", True),
     ]
     assert extract_block("int F(void) { return 0; }") is None
+    assert check_block(BLOCK.replace("unk_08 : 4", "unk_08_0 : 4"), "") is None  # bitfield suffix
     assert check_block(BLOCK, "typedef int Other;") is None
 
 
@@ -171,6 +172,7 @@ def test_provisional_block_parses() -> None:
         ("/* rematch:types */\ntypedef struct UnkStruct_02001000 { u8 unk_00; } X;\n", "end-types"),
         (BLOCK.replace("UnkStruct_02001000", "MyStruct"), "UnkStruct_"),
         (BLOCK.replace("unk_04;", "count;"), "unk_XX"),
+        (BLOCK.replace("unk_04;", "unk_04x;"), "unk_XX"),
         (BLOCK.replace("u16 unk_04; // comment", "struct { u8 unk_0; } unk_04;"), "nested"),
         (BLOCK.replace("typedef struct", "struct", 1), "only `typedef"),
     ],

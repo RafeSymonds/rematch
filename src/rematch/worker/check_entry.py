@@ -34,6 +34,7 @@ _FORBIDDEN = (
 )
 _INCLUDE = re.compile(r'^\s*#\s*include\s*(?P<what>[<"][^>"]*[>"])', re.MULTILINE)
 _COMMENTS = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
+_OWN_CTX_INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"ctx\.h"[^\n]*$', re.MULTILINE)
 
 
 # --- target cache (written by the sandbox builder) -----------------------------------
@@ -162,10 +163,13 @@ def evaluate(
     build.mkdir(parents=True, exist_ok=True)
     rel_ctx = Path(*([".."] * len(build.relative_to(sandbox).parts)))
     results: list[VersionResult] = []
+    # The scratch file includes the context itself; a candidate's own `#include "ctx.h"`
+    # (allowed, and common) would resolve from the build directory, so blank it out in place.
+    body = _OWN_CTX_INCLUDE.sub("", candidate)
     for vt in task.versions:
         scratch = build / f"scratch.{vt.version}.c"
         scratch.write_text(
-            scratch_source(candidate, (rel_ctx / vt.ctx).as_posix())
+            scratch_source(body, (rel_ctx / vt.ctx).as_posix())
             + keep_reference(candidate, task.symbol),
             encoding="utf-8",
         )

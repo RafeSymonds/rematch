@@ -8,7 +8,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
-from rematch.context.examples import naive_examples
+from rematch.context.examples import naive_examples, similar_examples
 from rematch.db import store
 from rematch.session import Session
 from rematch.worker.attempt import (
@@ -71,9 +71,25 @@ def run_functions(
     effort_for = effort_for or {}
     conn = store.connect(s.db_path)
     try:
-        config = run_config(s, model, effort, {"kind": kind, "seed": seed, **(extra_config or {})})
+        config = run_config(
+            s,
+            model,
+            effort,
+            {
+                "kind": kind,
+                "seed": seed,
+                "examples_mode": s.settings.examples_mode,
+                **(extra_config or {}),
+            },
+        )
         run_id = start_run(conn, kind, config, bench_set)
-        examples = {fn.id: naive_examples(conn, fn, s.settings.examples_k, seed) for fn in fns}
+        if s.settings.examples_mode == "similar":
+            examples = {
+                fn.id: similar_examples(s, conn, fn, s.settings.examples_k, bench, log)
+                for fn in fns
+            }
+        else:
+            examples = {fn.id: naive_examples(conn, fn, s.settings.examples_k, seed) for fn in fns}
     finally:
         conn.close()
     gate = _Gate()

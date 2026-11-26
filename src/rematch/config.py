@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     max_attempts_per_function: int = Field(default=4, ge=1)
     retry_cooldown_min: int = Field(default=240, ge=0)
     examples_k: int = Field(default=3, ge=0)
+    examples_mode: Literal["naive", "similar"] = "similar"  # SPEC §6.7; naive = Phase 2 baseline
     reference_repos: str = ""
     diff_backend: Literal["objdiff", "objdump"] = "objdump"
     objdiff_bin: str = "objdiff-cli"

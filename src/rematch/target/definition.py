@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tomllib
 from pathlib import Path, PurePosixPath
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
@@ -35,11 +36,61 @@ class VersionDef(BaseModel):
     build: list[str] = Field(min_length=1)
     rom: str
     sha1: str = Field(pattern=r"^[0-9a-f]{40}$")
+    build_dir: str | None = None  # Phase 1: holds compile_commands and the map file
 
-    @field_validator("rom")
+    @field_validator("rom", "build_dir")
     @classmethod
-    def _rom_relative(cls, value: str) -> str:
+    def _rom_relative(cls, value: str | None) -> str | None:
+        return None if value is None else _check_relative(value)
+
+
+class _Section(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class BuildSection(_Section):
+    compile_commands: str = "compile_commands.json"  # relative to the version's build_dir
+    map: str  # linker map, relative to the version's build_dir
+    map_format: Literal["mwld-xmap"]
+
+    @field_validator("compile_commands", "map")
+    @classmethod
+    def _relative(cls, value: str) -> str:
         return _check_relative(value)
+
+
+class SourceSection(_Section):
+    asm: list[str] = []  # globs of assembly TUs
+    c: list[str] = []  # globs of C TUs
+    exclude: list[str] = []  # globs excluded from inventory (status 'skipped')
+    include_dirs: list[str] = []  # header index roots
+    version_defines: list[str] = []  # macros whose #if blocks make a TU version-conditional
+
+
+class LinkOrderSection(_Section):
+    file: str
+    format: Literal["nitro-lsf"]
+
+    @field_validator("file")
+    @classmethod
+    def _relative(cls, value: str) -> str:
+        return _check_relative(value)
+
+
+class AsmSection(_Section):
+    format: Literal["pret-macros"]
+
+
+class ContextSection(_Section):
+    # argv run through TOOLCHAIN_EXEC in the vanilla worktree; prints a flattened header context.
+    # Placeholders: {target_dir} (.rematch/ of TARGET_REPO), {version}, {input} (stub .c path).
+    command: list[str] = Field(min_length=1)
+
+
+class NamingSection(_Section):
+    # str.format templates; fields: address (int), overlay (int, overlays only), module (str).
+    anonymous: str = "sub_{address:08X}"
+    overlay_anonymous: str = "sub_{address:08X}"
 
 
 class TargetDef(BaseModel):
@@ -51,6 +102,14 @@ class TargetDef(BaseModel):
     forbidden_push_urls: list[str] = []
     required_paths: list[str] = []
     versions: dict[str, VersionDef]
+    # Phase 1 sections. Optional so a Phase 0 target still validates; commands that need one
+    # fail with a clear message (TargetDef.require).
+    build_info: BuildSection | None = Field(default=None, alias="build")
+    source: SourceSection | None = None
+    link_order: LinkOrderSection | None = None
+    asm: AsmSection | None = None
+    context: ContextSection | None = None
+    naming: NamingSection = NamingSection()
 
     @field_validator("required_paths")
     @classmethod
@@ -69,7 +128,23 @@ class TargetDef(BaseModel):
         missing = [v for v in self.default_versions if v not in self.versions]
         if missing:
             raise ValueError(f"default_versions without a [versions.<name>] table: {missing}")
+        if self.build_info is not None:
+            no_dir = [name for name, v in self.versions.items() if v.build_dir is None]
+            if no_dir:
+                raise ValueError(f"[build] requires build_dir in every version: {no_dir}")
         return self
+
+    def require[T](self, section: T | None, name: str) -> T:
+        """Return a Phase 1+ section or fail with a message naming the missing table."""
+        if section is None:
+            raise TargetDefError(f"target.toml has no [{name}] section, which this command needs")
+        return section
+
+    def build_dir(self, worktree: Path, version: str) -> Path:
+        rel = self.versions[version].build_dir
+        if rel is None:
+            raise TargetDefError(f"target.toml [versions.{version}] has no build_dir")
+        return worktree / rel
 
 
 def target_dir(target_repo: Path) -> Path:

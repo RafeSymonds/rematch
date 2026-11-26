@@ -48,9 +48,12 @@ def test_all_pass_and_builds_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         "push guard",
         "vanilla worktree",
         "toolchain exec",
+        "toolchain sees workdir",
         "build alpha",
         "build beta",
         "required paths",
+        "objdump",
+        "ctags",
         "database",
     ]
     vanilla = tmp_path / "demo-vanilla"
@@ -170,7 +173,7 @@ def test_cli_exit_codes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     cli = CliRunner()
     ok = cli.invoke(app, ["doctor"])
     assert ok.exit_code == 0, ok.output
-    assert ok.output.count("PASS") == 10
+    assert ok.output.count("PASS") == 13
 
     monkeypatch.delenv("TARGET_PIN")
     bad = cli.invoke(app, ["doctor"])

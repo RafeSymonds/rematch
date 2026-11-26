@@ -40,9 +40,10 @@ class Settings(BaseSettings):
     retry_cooldown_min: int = Field(default=240, ge=0)
     examples_k: int = Field(default=3, ge=0)
     reference_repos: str = ""
-    diff_backend: Literal["objdiff", "objdump"] = "objdiff"
+    diff_backend: Literal["objdiff", "objdump"] = "objdump"
     objdiff_bin: str = "objdiff-cli"
     objdump: str = "objdump"
+    ctags: str = "ctags"
     bench_cutoff_date: str = "2026-07-01"
     compile_timeout_sec: float = Field(default=20, gt=0)
     log_level: str = "info"

@@ -1,0 +1,27 @@
+# Local state and secrets
+var/
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+
+# ROMs, saves, BIOS and firmware: never commit
+*.nds
+*.gba
+*.gb
+*.gbc
+*.z64
+*.n64
+*.v64
+*.iso
+*.sav
+bios*.bin
+*bios7*
+*bios9*
+firmware*.bin

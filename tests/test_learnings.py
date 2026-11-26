@@ -101,6 +101,8 @@ def test_names_target() -> None:
         "Widget_GetLevel",
     ]
     assert cr.names_target("u8 casts emit lsl", names) == []  # short/generic words never count
+    names |= {"types", "loop", "data"}  # plain words that also appear in target headers
+    assert cr.names_target('#include "types.h"\nint data; /* loop */', names) == []
 
 
 def test_apply_decisions_verifies_and_scopes(

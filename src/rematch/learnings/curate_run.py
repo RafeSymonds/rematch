@@ -106,8 +106,17 @@ def target_names(s: Session, conn: sqlite3.Connection) -> set[str]:
     return names - generic - _C_WORDS
 
 
+_INCLUDE = re.compile(r"^\s*#\s*include\b.*$", re.MULTILINE)
+
+
+def _distinctive(word: str) -> bool:
+    """Plain lowercase words ("loop", "data") are never evidence of naming the target."""
+    return "_" in word or any(c.isdigit() or c.isupper() for c in word)
+
+
 def names_target(text: str, names: set[str]) -> list[str]:
-    return sorted({w for w in re.findall(r"\b[A-Za-z_]\w{3,}\b", text) if w in names})
+    words = re.findall(r"\b[A-Za-z_]\w{3,}\b", _INCLUDE.sub("", text))
+    return sorted({w for w in words if w in names and _distinctive(w)})
 
 
 # --- sandbox ---------------------------------------------------------------------------

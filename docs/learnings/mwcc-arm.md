@@ -1,0 +1,34 @@
+# Compiler quirks: mwcc-arm
+
+- In a sparse switch, an explicit case sharing the default body (`case 100: default:`) still emits its own compare (`cmp r0, #100`) before the branch to that body, while a bare `default:` does not.
+- A value computed from locals (`int n = (a + b) / 32; h(); k(n);`) can have its computation delayed past an intervening call, while writing the calls inside the expression (`int n = (g() + g()) / 32;`) finishes computing it right after them.
+- A literal-pool operand shown as `<str:"">` that is loaded and then dereferenced can be a file-local variable: `static T *p;` produces it, while `extern T *p;` shows the symbol name.
+- `S l = *(const S *)&sym;` (S wraps an array) copies like a local array initializer `int l[6] = {...};`, but the literal pool names `sym` instead of anonymous data.
+- `if (a() || b() || !c()) return 0;` shares one return block (`bne` to it), while separate `if (a()) return 0;` statements each emit their own return.
+- Passing an `int` local to a `u8` parameter truncates at the call (`lsls #24; lsrs #24`), while a `u8` local (`u8 x = h();`) is truncated at assignment and passed with a plain move.
+- An unreferenced `static` function is not emitted; any reference, such as `return (void *)f;` or a non-static `void (*ref)(int *) = f;`, makes the compiler emit it.
+- `V v = {0, 0, 0};` stores through a base register (`add r0, sp, #N; str r1, [r0, #4]`), while `v.x = 0; v.y = 0; v.z = 0;` stores sp-relative.
+- In array loops, `T *p = &arr[i]; p->a = src[i];` instead of repeated `arr[i].a = src[i];` can swap the registers holding the strength-reduced pointers.
+- A large local initializer such as `u16 a[41] = {1, 2};` copies anonymous rodata (`<data:SIZE:HASH>`, so every value must be exact) with a count-down `ldrh`/`strh` loop, unlike a hand-written copy loop from a named table.
+- `if (x == 3 || x == 4)` folds to a range check (`subs #3; cmp #1; bhi`), while `switch (x) { case 3: case 4: }` emits separate `cmp`/branch pairs.
+- `d->sub.arr[i] = x;` adds the member offset on every store, while `Sub *s = &d->sub; s->arr[i] = x;` adds the struct offset once and puts the array offset in the `strb` immediate.
+- If a loop counter and a strength-reduced pointer have swapped callee-saved registers, try separate counters per loop (`i`, `j`) instead of reusing one.
+- Storing -1 in a loop `a[i] = -1;` emits `subs r0, r1, #1` (from a zero register) for an `s8` array but `movs r0, #255` for a `u8` array.
+- With an `s16 i`, `i < NELEMS(arr)` compares unsigned (`bcc`), while `i < 60` compares signed (`blt`).
+- `(g(0) + g(1)) / 2` with `u32` returns divides unsigned (`lsrs #1`), while `(int)(g(0) + g(1)) / 2` emits the signed `lsrs #31; adds; asrs #1`.
+- `x = x - 7; k(x, ...);` on a `u16` local does the subtract before setting up stack arguments, while `k((u16)(x - 7), ...);` schedules it among them.
+- `for (i = 0; tbl[i] != 0xFFFF; i++)` over an extern table emits an entry check before the loop, while `do { ... i++; } while (tbl[i] != 0xFFFF);` does not.
+- A NULL test on a value just copied with `adds rN, rM, #0` needs no `cmp`: `if (p != NULL)` branches on the copy's flags, while `if (p != (int *)4)` emits `cmp rN, #4`.
+- `arr[i].a = 0;` in a loop is strength-reduced to a pointer stepped by the element size (`adds r3, #3`), unlike manual byte offsets `*((u8 *)arr + i * 3)`, so write plain indexing.
+- `A a = f();` for a returned struct builds it in a temporary and then copies it, while `A a; a = f();` can drop the copy when only a member is then read.
+- Assigning an all-zero compound literal `s->v = (V){0, 0, 0};` stores zeros with `str`, while a non-zero one `(V){1, 2, 3}` copies from anonymous rodata (`ldr rN, =<data:...>`).
+- A constant aggregate initializer inside a loop body (`for (...) { V s = {4096, 4096, 4096}; g(&s); }`) is loaded into a hidden temporary once before the loop body and copied from it into `s` every iteration, so an early copy can belong to a loop-body local.
+- Declaration order can set the stack slots of spilled scalar locals: with both spilled, `int a; int b;` put `a` above `b`, and `int b; int a;` swapped them.
+- A jump-table switch lays out case bodies in source order (writing `case 3:` before `case 0:` moves its body first), so order the C cases by body address after decoding the table.
+- A small `switch (x)` on 0/1/2 emits all compares first (in ascending value order) and then the bodies in source order, while `if (x == 0) ... else if (x == 1) ...` places each `cmp`/`bne` just before its body.
+- Comparison constants are kept as written: `x < 8` emits `cmp #8; bge`, while `x <= 7` emits `cmp #7; bgt`.
+- Assigning an int expression to a narrow local truncates at the assignment (`u16 v = x + 3;` adds `lsls #16; lsrs #16`, `u8` uses #24, even if the value already fits), while `int v` does not.
+- Parentheses control constant arithmetic order: `a + b - 5` adds then subtracts, while `a + (b - 5)` subtracts from `b` first.
+- Operand order of a multiply can set load order: `s->a * s->b` loads `a` first and `s->b * s->a` loads `b` first.
+- Address-taken locals of one block (scalars, arrays, structs) are placed by declaration order, the earlier declared at the higher stack address: `T t; int ids[6];` puts `ids` below `t`.
+- Local declaration order affects which register each local gets (and can decide which one is spilled): `int i; int *r = NULL;` versus `int *r = NULL; int i;` swaps r4/r5.

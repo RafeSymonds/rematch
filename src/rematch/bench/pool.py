@@ -16,7 +16,7 @@ from rematch.session import Session
 from rematch.worker.roundtrip import roundtrip
 from rematch.worker.sandbox import find_function
 
-CONTEXT_VERSION = 1
+CONTEXT_VERSION = 2
 Log = Callable[[str], None]
 
 

@@ -284,6 +284,9 @@ def bench(
     n: int = typer.Option(..., help="Set size."),
     seed: int = typer.Option(42),
     pool: str = typer.Option("clean", help="clean or contaminated (§11.1)."),
+    size_bucket: str | None = typer.Option(
+        None, "--bucket", help="Only one size bucket: S, M or L (set id gets -S/-M/-L)."
+    ),
     workers: int | None = typer.Option(None, help="Parallel attempts (default WORKER_COUNT)."),
     model: str | None = typer.Option(None),
     effort: str | None = typer.Option(None),
@@ -293,7 +296,7 @@ def bench(
     from rematch.bench.pool import Prescreen, pool_sizes
     from rematch.bench.report import append_row, benchmarks_row, format_report, run_metrics
     from rematch.bench.run import run_functions
-    from rematch.bench.sets import load_set, save_set, set_id, stratified_sample
+    from rematch.bench.sets import bucket, load_set, save_set, set_id, stratified_sample
     from rematch.target.definition import target_dir
     from rematch.worker.sandbox import find_function
 
@@ -302,12 +305,18 @@ def bench(
         raise typer.Exit(2)
     s = _session()
     cutoff = s.settings.bench_cutoff_date
+    if size_bucket not in (None, "S", "M", "L"):
+        typer.echo("--bucket must be S, M or L")
+        raise typer.Exit(2)
     sid = set_id(n, seed, cutoff) + ("" if pool == "clean" else "-contaminated")
+    sid += f"-{size_bucket}" if size_bucket else ""
     conn = store.connect(s.db_path)
     try:
         ids = load_set(conn, sid)
         if ids is None:
             sizes = pool_sizes(conn, pool, cutoff)
+            if size_bucket:
+                sizes = {k: v for k, v in sizes.items() if bucket(v) == size_bucket}
             typer.echo(f"pool {pool}: {len(sizes)} functions; building set {sid}")
             prescreen = Prescreen(s, conn, _echo_err, s.settings.worker_count)
             ids, rejected = stratified_sample(sizes, n, seed, prescreen.eligible)

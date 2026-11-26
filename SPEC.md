@@ -45,7 +45,42 @@ rom = "build/us/game.us.bin"               # relative to the worktree
 sha1 = "0123456789abcdef0123456789abcdef01234567"
 ```
 
-Validation: every name in `default_versions` has a `[versions.<name>]` table; `sha1` is 40 lowercase hex characters; `rom` and `required_paths` are relative and contain no `..`; `build` is a non-empty argv list. Later phases add sections (asm format, link order, compiler argv source, excluded directories, worker prompt intro) and update this section when they do.
+Validation: every name in `default_versions` has a `[versions.<name>]` table; `sha1` is 40 lowercase hex characters; `rom` and `required_paths` are relative and contain no `..`; `build` is a non-empty argv list. Later phases add sections and update this section when they do.
+
+### 2.1.1 Phase 1 fields
+
+```toml
+[versions.us]
+build_dir = "build/us"                     # holds compile_commands.json and the map file
+
+[build]
+compile_commands = "compile_commands.json" # relative to build_dir (default shown)
+map = "main.map"                           # linker map, relative to build_dir
+map_format = "mwld-xmap"                   # Metrowerks linker xMAP
+
+[source]
+asm = ["asm/**/*.s"]                       # globs of assembly TUs
+c = ["src/**/*.c"]                         # globs of C TUs
+exclude = ["lib/**"]                       # inventoried as status 'skipped'
+include_dirs = ["include"]                 # header index roots
+version_defines = ["US", "JP"]             # macros whose #if blocks make a TU version-conditional
+
+[link_order]
+file = "link.lsf"
+format = "nitro-lsf"                       # NitroSDK LSF: Static/Autoload/Overlay blocks of Object lines
+
+[asm]
+format = "pret-macros"                     # `thumb_func_start NAME` / `NAME: ; 0xADDR` / `_ADDR: .word X`
+
+[context]
+command = ["sh", "{target_dir}/make_ctx.sh", "{version}", "{input}"]
+
+[naming]
+anonymous = "sub_{address:08X}"            # str.format; fields: address, overlay (overlays only), module
+overlay_anonymous = "ov{overlay:02d}_{address:08X}"
+```
+
+Phase 1 sections are optional for validation, and the commands that need one fail with a message naming the missing table. `[build]` requires `build_dir` in every version. Formats are names of parsers implemented in rematch for toolchain and ecosystem formats (never per-game code). Adding a format means adding a parser with fixture tests. The `[context]` command runs through `TOOLCHAIN_EXEC` with cwd = the vanilla worktree, receives a stub `.c` containing `#include` lines as `{input}`, and prints a flattened context (types, prototypes and macro definitions) on stdout.
 
 ### 2.2 `TARGET.md`
 
@@ -85,8 +120,10 @@ rematch/
     context/header_index.py  context/ctx_builder.py  context/similarity.py  context/examples.py
     toolchain/runner.py          # runs target toolchain commands through TOOLCHAIN_EXEC
     toolchain/compile.py  toolchain/objects.py
-    diff/base.py  diff/objdiff_backend.py  diff/objdump_backend.py  diff/score.py  diff/hints.py  diff/render.py
-    worker/sandbox.py  worker/check_entry.py  worker/invoke.py  worker/outcome.py
+    diff/match.py  diff/objdump_backend.py  diff/score.py  diff/hints.py  diff/render.py
+    toolchain/compile_db.py      # compile_commands.json: argv and object path per TU
+    session.py                   # settings + target + vanilla worktree for target commands
+    worker/sandbox.py  worker/task.py  worker/check_entry.py  worker/roundtrip.py  worker/invoke.py  worker/outcome.py
     orchestrator/scheduler.py  orchestrator/leases.py  orchestrator/escalation.py  orchestrator/run.py
     integrate/tu_builder.py  integrate/lsf.py  integrate/verify.py
     bench/pool.py  bench/sets.py  bench/report.py
@@ -140,9 +177,10 @@ This repo is target-agnostic: no game names, target paths, host names or persona
 | `RETRY_COOLDOWN_MIN` | `240` | |
 | `EXAMPLES_K` | `3` | Similar matched functions per sandbox |
 | `REFERENCE_REPOS` | (empty) | Comma-separated paths to related decomp repos (same engine or compiler) for cross-repo examples (Phase 3) |
-| `DIFF_BACKEND` | `objdiff` | `objdiff` or `objdump` |
+| `DIFF_BACKEND` | `objdump` | `objdump` or `objdiff` (§6.5) |
 | `OBJDIFF_BIN` | `objdiff-cli` | |
 | `OBJDUMP` | `objdump` | Disassembler for the target's architecture (for example `arm-none-eabi-objdump`) |
+| `CTAGS` | `ctags` | Universal Ctags, used by the header index (§6.3) |
 | `BENCH_CUTOFF_DATE` | `2026-07-01` | Contamination cutoff (§11.1) |
 | `COMPILE_TIMEOUT_SEC` | `20` | |
 | `LOG_LEVEL` | `info` | |
@@ -237,7 +275,7 @@ Migrations are forward-only SQL files in `db/migrations/NNNN_*.sql`, applied in 
 
 ### 6.0 TargetAdapter (protocol)
 
-Every target-specific behavior goes through this interface. Phase 0 implements the first four methods from `target.toml`. Where the rest come from (more `target.toml` sections, or an optional `.rematch/adapter.py`) is decided in Phase 1.
+Every target-specific behavior goes through this interface. All of it is implemented from `target.toml` (§2.1): compile argv and object paths come from `compile_commands.json`, and link order, assembly and map parsing use named format parsers in rematch. There is no per-target Python code (decided in Phase 1).
 
 ```python
 class TargetAdapter(Protocol):
@@ -258,9 +296,11 @@ class TargetAdapter(Protocol):
 
 ### 6.1 Inventory (`rematch inventory`)
 
-- Parse every assembly TU using the target's assembly format (TARGET.md). For each function, record name, address, mode, instruction count (instruction lines only, excluding labels and directives), conditional/unconditional branch count, call targets, literal pool entries (data words after the function, up to the next function start), and switch tables (jump-table patterns for the ISA; mark `has_switch`).
+- Functions come from the vanilla objects of the primary version: every sized `FUNC` symbol (mapping symbols excluded) of every TU in the link-order file, with its address from the linker map. Functions in an object but not in the map (dead-stripped) are logged and skipped.
+- Features come from the normalized disassembly of the vanilla object (§6.5), for assembly and C alike: instruction count (data words excluded), conditional/unconditional branch count (calls and returns excluded), call targets (relocations on `bl`/`blx`), literal pool entries (data words), and `has_switch` (a computed jump that writes `pc`). Mode comes from the ARM mapping symbol (`$t`/`$a`) at the function start.
+- The assembly parser (target format, TARGET.md) supplies each function's source text and address comment. A comment that disagrees with the map is logged, not fatal (it is usually another version's address).
 - Module is the module or overlay containing the TU, from the link-order file.
-- C functions: from the vanilla build's symbols (map file / ELF symtab) intersected with C source definitions. Fallback: a regex over column-0 definitions (`^[A-Za-z_].*\)\s*\{\s*$`).
+- C TUs are `c_human`, assembly TUs `asm`. The C parser (`inventory/c_parser.py`) finds definitions and their bodies for round-trips and TU-local context (§6.4).
 - Exclude library and SDK code in v1 (directories listed by the target): `status='skipped'`.
 - Compute `difficulty` (§8.3). Inventory is idempotent and keyed by `(module, address)`. Renames upstream update `name` but keep the row.
 
@@ -281,31 +321,38 @@ For each function, produce a sandbox `ctx.h`:
 
 ### 6.4 Compile-and-diff (`rematch cd`): the worker's only tool
 
-Invocation inside a sandbox: `./check` (no arguments). It calls `rematch cd --sandbox . --json-out .history/NNN.json` and prints the text rendering (§6.6).
+Invocation inside a sandbox: `./check` (no arguments). It runs `rematch cd --sandbox <dir>` and prints the text rendering (§6.6). `cd` reads only the sandbox: `task.json` records the compile argv per version, the toolchain prefix, the disassembler and the limits, so `./check` needs no `.env`. Exit codes: 0 `MATCH`, 1 no match (including compile errors and rejections), 3 `STOP`.
 
 Steps:
-1. Read `candidate.c`. Reject immediately (status `rejected`, no compile; this counts as a check) if it contains: `asm`, `__asm`, any `#pragma`, an `#include` of anything except `"ctx.h"`, or more than one definition of the target function.
-2. Write scratch TU `scratch.c` = `#include "ctx.h"\n#line 1 "candidate.c"\n` + candidate.
-3. **Isolated mode (default):** compile `scratch.c` with `compile_command(tu.module, version)`, the exact argv from the vanilla build with the source and output swapped, with cwd = the vanilla worktree so include paths resolve, through `TOOLCHAIN_EXEC`. Timeout `COMPILE_TIMEOUT_SEC`.
+1. Read `candidate.c`. Reject immediately (status `rejected`, no compile; this counts as a check) if it contains (outside comments and string literals): `asm`, `__asm`, any `#pragma`, an `#include` of anything except `"ctx.h"`, no definition of the target function, or more than one.
+2. Write scratch TU `scratch.<version>.c` = `#include "<ctx>"\n#line 1 "candidate.c"\n` + candidate. If the candidate defines the target `static`, append `void *const rematch_keep_<symbol> = (void *)<symbol>;`: nothing references the function in isolation, so the compiler would not emit it. The worker never sees this line.
+3. **Isolated mode (default):** compile the scratch TU with the exact argv from the vanilla build's `compile_commands.json` entry for the TU (for an assembly TU: the first C entry with the same output directory), with only the source and output swapped, cwd = the entry's `directory`, through `TOOLCHAIN_EXEC`. Timeout `COMPILE_TIMEOUT_SEC`.
+   - Context for a human-C target (bench, round-trip) = the flattened headers of the TU's `#include` lines, plus the TU's own declarations: its text without `#include` lines and without the target's definition, with `inline` bodies kept and every other body turned into a prototype. Other functions' `static` prototypes lose `static`, because mwcc rejects a call to a static function it never sees defined.
+   - Context for an assembly target = the flattened base header plus the headers declaring its callees (header index).
 4. **TU-context mode (escalation):** for `c_human` (bench) targets, compile a copy of the original TU with only the target body replaced. For `asm` targets (Phase 5), build a C file where neighbor functions are `GLOBAL_ASM` blocks via a tool such as asm_processor, if the target supports one. Codegen can depend on neighbors when the compiler does file-level interprocedural analysis or inlining.
-5. Compile errors are returned as at most 15 lines, with line numbers relative to `candidate.c`.
+5. Compile errors are returned as at most 15 lines, with paths stripped and line numbers relative to `candidate.c`. Some compilers (mwcc) report physical scratch lines despite `#line`, so `cd` maps them itself.
 6. Diff the candidate symbol against the target symbol (§6.5) for each version in `TARGET_VERSIONS` where the TU has version conditionals, otherwise for the primary version only.
-7. Persist every candidate and result to `.history/NNN.{c,json}`. Track `best_score`. Enforce `MAX_CHECKS` and `STAGNATION_LIMIT`: when either trips, print `STOP: <reason>. Write SUMMARY.json and end.` and exit with code 3.
+7. Persist every candidate and result to `.history/NNN.{c,json}` (the JSON includes per-version match, score, reasons, fired hint rule ids and wall time), and the counters in `.history/state.json`. Track `best_score`. Enforce `MAX_CHECKS` and `STAGNATION_LIMIT` (consecutive checks without a new best, rejected and failed compiles included): when either trips, print `STOP: <reason>. Write SUMMARY.json and end.` and exit with code 3. A `./check` after the limit prints `STOP` and does not compile.
 8. Median wall time per check must be **≤ 3 s** on the worker host (Phase 1 exit criterion).
 
 ### 6.5 Diff and scoring
 
-**Match (binary)**, all of the following for the symbol:
-- identical code bytes after relocation normalization
-- identical relocation lists (offset, type, target symbol name, addend)
-- identical literal pool contents (values or relocation targets)
+**Match (binary)**, all of the following for the symbol, computed from the ELF objects (`diff/match.py`), independent of any disassembler:
 - identical symbol size
+- identical code bytes with relocation sites zeroed (literal pool values included)
+- identical relocation lists: (offset, kind, normalized target). Kind is `call:bl`/`call:blx` for calls, the relocation type otherwise. Normalized target:
+  - named symbols: name and addend. The function's own name is `<self>` (so a renamed bench symbol still matches).
+  - anonymous targets (string literals such as `@123`, section-relative references): the referenced bytes (strings shown as text, other data as length and hash, `.bss` as size). Isolation changes their offsets and numbering, not their contents.
+  - function-scope statics (mwcc `name$NNNN`, the counter depends on the whole TU): name stem plus content.
+  - a call the assembler resolved without a relocation (callee in the same section, common in assembly TUs) counts as a call to that callee.
+Relocations are read as RELA; REL implicit addends are decoded from the patched bytes.
 
 **Score (0–100)** for partial credit: align the normalized instruction sequences (Levenshtein). Cost per aligned pair: exact 0, same mnemonic with different operands 0.5, different mnemonic 1, insertion or deletion 1. `score = 100 × (1 − cost / max(len_target, len_candidate))`. A score of 100 without a binary match (for example a pool or relocation mismatch) displays as `99.9`.
 
 **Backends:**
-- `objdiff` (preferred). **VERIFY (Phase 1):** that `objdiff-cli` can produce a one-shot, machine-readable diff for one symbol between two ELF objects for the target's architecture. If the CLI can't, write a tiny Rust binary on the `objdiff-core` crate, or use the fallback.
-- `objdump` (fallback): `$OBJDUMP -d -r --no-show-raw-insn` with the target's per-mode disassembler options (for example `-M force-thumb` for Thumb symbols, because some compilers emit objects without `$t`/`$a` mapping symbols; **VERIFY** per target). Normalize addresses to symbol-relative offsets, replace relocation sites with `<reloc:TYPE:symbol+addend>`, and map local branch targets to relative labels.
+The backend only produces the rows for score, hints and rendering:
+- `objdump` (default): `$OBJDUMP -d -r --no-show-raw-insn`, relying on the objects' ARM mapping symbols for the mode (TARGET.md records whether a target's objects carry them). Lines are normalized: offsets relative to the function, local branch targets as `.L<k>` (numbered by target order), calls and pool loads show the normalized target (`ldr r0, =Symbol`, `ldr r0, =0x1f4`).
+- `objdiff`: `objdiff-cli diff -1 A -2 B -o - --format json` has a one-shot mode, but it emits a whole-object `DiffResult`. Adopt it only if objdump rows prove insufficient.
 
 ### 6.6 Text rendering and hints (what the worker sees)
 
@@ -361,6 +408,9 @@ $REMATCH_WORKDIR/attempts/<attempt_id>/
   LEARNINGS.md     # copy of docs/LEARNINGS.md
   candidate.c      # starts as draft.c or a stub with the right signature if known
   check            # executable wrapper → rematch cd (§6.4)
+  task.json        # symbol, target symbol, TU, mode, per-version compile argv and context, limits
+  ctx.<version>.h  # context for each extra version of a version-conditional TU
+  .target/         # normalized vanilla lines and match view per version (written by the builder)
   NOTES.md         # worker may append proposed learnings here
   SUMMARY.json     # worker writes at the end (untrusted)
   .history/        # written only by ./check
@@ -505,7 +555,8 @@ rematch doctor                      # Claude Code version, workdir, push guard, 
 rematch inventory [--history]       # parse target; --history computes decompiled_at
 rematch selftest                    # oracle + saboteur agents, zero tokens (§14)
 rematch cd --sandbox DIR [--json-out F] [--mode isolated|tu]   # used by ./check
-rematch ctx FUNCTION --out DIR      # build a sandbox without running a worker (debugging)
+rematch ctx FUNCTION --out DIR [--with-source]   # build a sandbox without a worker; --with-source seeds human C (never for bench)
+rematch roundtrip [--n N --seed S | --golden]    # human C through ./check must match (Phase 1 exit; .rematch/golden.toml)
 rematch attempt FUNCTION [--model M --effort E]                # one live attempt
 rematch bench --n N --seed S [--pool clean] [--workers W] [--model M --effort E]
 rematch run --workers W [--max-attempts K] [--until HH:MM]     # live loop
@@ -516,7 +567,7 @@ rematch learnings review            # interactive accept/reject of candidates
 rematch sync-upstream
 ```
 
-`rematch doctor` prints one `PASS`/`FAIL` line per check and exits 1 if any check fails. Checks, in order: `CLAUDE_BIN --version` ≥ 2.1.259 (spends no tokens); `REMATCH_WORKDIR` and ancestors clean (§4); `target.toml` valid (§2.1); no push URL in `TARGET_REPO` matches `forbidden_push_urls` and the installed pre-push hook matches `.rematch/pre-push` (§2.3); vanilla worktree at the pin (§6.2); `TOOLCHAIN_EXEC` runs `true` (if set); per-version build and hash (§6.2); `required_paths` present; DB migrated (§5).
+`rematch doctor` prints one `PASS`/`FAIL` line per check and exits 1 if any check fails. Checks, in order: `CLAUDE_BIN --version` ≥ 2.1.259 (spends no tokens); `REMATCH_WORKDIR` and ancestors clean (§4); `target.toml` valid (§2.1); no push URL in `TARGET_REPO` matches `forbidden_push_urls` and the installed pre-push hook matches `.rematch/pre-push` (§2.3); vanilla worktree at the pin (§6.2); `TOOLCHAIN_EXEC` runs `true` (if set); the toolchain sees `REMATCH_WORKDIR` (sandboxes are compiled through it); per-version build and hash (§6.2); `required_paths` present; `OBJDUMP` runs; `CTAGS` is Universal Ctags; DB migrated (§5).
 
 Model and effort: `attempt` and `bench` use `--model`/`--effort` if given, else `WORKER_MODEL`/`WORKER_EFFORT`. `run` starts each function at rung 0 of `ESCALATION_LADDER` and escalates through it (§8.4). The resolved model and effort are stored on every attempt.
 

@@ -58,3 +58,26 @@ def run_m2c(m2c: Path, asm: str, context: Path | None, timeout: float = 60) -> s
             if result.returncode == 0 and result.stdout.strip():
                 return result.stdout
     return None
+
+
+_PROTO = re.compile(
+    r"^(?P<head>[^;{}]*?\b(?P<name>\w+)\s*\((?P<params>[^;{}]*)\))\s*;", re.MULTILINE
+)
+
+
+def apply_prototype(function: str, symbol: str, declarations: str) -> str:
+    """Give m2c's function the real prototype, renaming its argN parameters by position."""
+    plain = "\n".join(ln for ln in declarations.splitlines() if not ln.lstrip().startswith("//"))
+    proto = next((m for m in _PROTO.finditer(plain) if m.group("name") == symbol), None)
+    if proto is None:
+        return function
+    brace = function.find("{")
+    if brace < 0:
+        return function
+    params = [p.strip() for p in proto.group("params").split(",") if p.strip()]
+    names = [re.findall(r"\w+", p)[-1] if p != "void" else None for p in params]
+    body = function[brace:]
+    for i, real in enumerate(names):
+        if real:
+            body = re.sub(rf"\barg{i}\b", real, body)
+    return " ".join(proto.group("head").split()) + " " + body

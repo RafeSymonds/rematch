@@ -15,7 +15,7 @@ from pathlib import Path
 from rematch import prompts
 from rematch.context.declarations import declarations, read_tags
 from rematch.context.header_index import HeaderIndex
-from rematch.context.m2c import m2c_asm, run_m2c
+from rematch.context.m2c import apply_prototype, m2c_asm, run_m2c
 from rematch.diff.match import function_view
 from rematch.diff.objdump_backend import Line, disassemble, run_objdump
 from rematch.inventory import asm_parser, link_order
@@ -307,7 +307,9 @@ def build_sandbox(
             raise SandboxError(f"no C source for {fn.name} in {fn.tu_path}")
         candidate = _rename(source, fn.name, symbol) + "\n"
     elif draft is not None and (body := function_source(draft, symbol)) is not None:
-        # m2c's preamble guesses externs with `?` types; seed only the function itself.
+        # m2c's preamble guesses externs with `?` types; seed only the function itself, with
+        # the real prototype when ctx.h has one.
+        body = apply_prototype(body, symbol, decls)
         candidate = (
             f"// Starting point: m2c's draft (see draft.c). Fix it until ./check matches.\n{body}\n"
         )

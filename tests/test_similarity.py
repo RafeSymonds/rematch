@@ -37,3 +37,24 @@ def test_rank_excludes_and_orders(tmp_path: Path) -> None:
     save_cache(tmp_path / "c.json", "pin:1", pool)
     assert load_cache(tmp_path / "c.json", "pin:1") == pool
     assert load_cache(tmp_path / "c.json", "pin:2") is None
+
+
+def test_m2c_apply_prototype_and_asm() -> None:
+    from rematch.context.m2c import apply_prototype, m2c_asm
+
+    draft = "void sub_1(void *arg0, s32 arg1) {\n    arg0->unk4 = arg1 + arg10;\n}"
+    decls = "// ctx.h:9\nvoid sub_1(Thing *thing, int count);\nint Other(int arg0);"
+    out = apply_prototype(draft, "sub_1", decls)
+    assert out.startswith("void sub_1(Thing *thing, int count) {")
+    assert "thing->unk4 = count + arg10;" in out  # arg10 is not arg1
+    assert apply_prototype(draft, "sub_2", decls) == draft
+    lines = [
+        Line(0, "cmp", "r0, #1"),
+        Line(2, "bne.n", ".L0"),
+        Line(4, "bl", "<self>", reloc="<self>"),
+        Line(8, "ldr", 'r0, =<str:"hi">', label=".L0"),
+        Line(12, ".word", "gX", is_data=True),
+    ]
+    asm = m2c_asm("sub_1", lines)
+    assert "sub_1:\n" in asm and "\tbne .L0" in asm and ".L0:\n\tldr r0, =anon_0" in asm
+    assert "\tbl sub_1" in asm and "\t.word gX" in asm

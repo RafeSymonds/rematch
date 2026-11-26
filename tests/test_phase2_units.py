@@ -378,7 +378,12 @@ def test_prompts_render() -> None:
         previous_best_score=None,
         max_checks=40,
         version_cond=True,
+        target_s="\tbx lr",
+        declarations="void sub_1(void);",
+        ctx_kb=1000,
+        learnings="(none)",
     )
+    assert "\tbx lr" in task and "void sub_1(void);" in task and "1000 KB" in task
     assert "sub_1" in task and "every target version" in task and "draft.c" not in task
 
 

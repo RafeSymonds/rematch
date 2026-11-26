@@ -75,7 +75,9 @@ def is_call(line: Line) -> bool:
 
 def run_objdump(objdump: str, path: Path, timeout: float = 60) -> str:
     result = subprocess.run(
-        [objdump, "-d", "-r", "--no-show-raw-insn", str(path)],
+        # -z: RELA objects hold zeros at every relocated literal-pool word, and objdump would
+        # otherwise collapse them into "..." and drop them from the listing.
+        [objdump, "-d", "-r", "-z", "--no-show-raw-insn", str(path)],
         capture_output=True,
         text=True,
         timeout=timeout,

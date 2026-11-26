@@ -67,6 +67,10 @@ def test_disassemble_normalizes(tmp_path: Path) -> None:
     obj = read_object(build(tmp_path, "a", SOURCE))
     lines = disassemble(run_objdump(OBJDUMP, obj.path), obj)
     rec = lines["Recurse"]
+    # A relocated pool word is all zeros in the object; it must still be listed (objdump -z).
+    assert any(ln.mnemonic == ".word" and ln.operands == "gGlobal" for ln in rec), [
+        ln.text for ln in rec
+    ]
     calls = [line.operands for line in rec if line.mnemonic.startswith("bl")]
     assert "Callee" in calls and "<self>" in calls
     assert all(not line.text.startswith(("0x", "<Recurse")) for line in rec)

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from rematch import prompts
+from rematch.context.declarations import declarations, read_tags
 from rematch.context.header_index import HeaderIndex
 from rematch.diff.match import function_view
 from rematch.diff.objdump_backend import Line, disassemble, run_objdump
@@ -274,10 +275,25 @@ def build_sandbox(
         )
 
     asm_format = s.definition.asm.format if s.definition.asm else None
+    names = [  # relocation targets without their addends ("sTable+0x4" -> "sTable")
+        re.split(r"[+-]0x", ln.reloc)[0]
+        for ln in primary_lines
+        if ln.reloc and not ln.reloc.startswith("<")
+    ]
+    called = {
+        ln.reloc for ln in primary_lines if ln.reloc and ln.mnemonic.split(".")[0] in ("bl", "blx")
+    }
+    decls = declarations(
+        (out / "ctx.h").read_text(encoding="utf-8", errors="replace"),
+        read_tags(s.settings.ctags, out / "ctx.h"),
+        functions=[symbol, *dict.fromkeys(n for n in names if n in called)],
+        data=list(dict.fromkeys(n for n in names if n not in called)),
+    )
     shown = FunctionRecord(
         fn.id, symbol, fn.address, fn.module, fn.tu_path, fn.source_kind, fn.mode, fn.version_cond
     )
-    (out / "target.s").write_text(render_target(shown, primary_lines, tu_text, asm_format))
+    target_s = render_target(shown, primary_lines, tu_text, asm_format)
+    (out / "target.s").write_text(target_s)
     if opts.with_source:
         source = function_source(tu_text, fn.name)
         if source is None:
@@ -295,7 +311,8 @@ def build_sandbox(
     check.chmod(0o755)
 
     example_names = write_examples(s, opts.examples, out)
-    (out / "LEARNINGS.md").write_text(LEARNINGS.read_text(encoding="utf-8"), encoding="utf-8")
+    learnings = LEARNINGS.read_text(encoding="utf-8")
+    (out / "LEARNINGS.md").write_text(learnings, encoding="utf-8")
     if opts.task_md:
         (out / "TASK.md").write_text(
             prompts.render(
@@ -310,6 +327,10 @@ def build_sandbox(
                 previous_best_score=None,
                 max_checks=s.settings.max_checks,
                 version_cond=fn.version_cond,
+                target_s=target_s.rstrip("\n"),
+                declarations=decls,
+                ctx_kb=(out / "ctx.h").stat().st_size // 1024,
+                learnings=learnings.strip(),
             ),
             encoding="utf-8",
         )

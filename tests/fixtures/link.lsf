@@ -1,0 +1,26 @@
+# comment line
+Static main
+{
+    Address 0x02000000
+    Library libfoo.a (.version)
+    Object src/a.c
+    Object asm/b.s   # trailing comment
+}
+
+Autoload ITCM
+{
+    Address 0x01FF8000
+}
+
+Overlay OV_A
+{
+    After main
+    Object asm/ov0.s
+}
+
+Overlay town
+{
+    After main
+    Object src/town/x.c
+    Object asm/town_y.s
+}

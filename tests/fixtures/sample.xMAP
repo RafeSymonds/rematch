@@ -1,0 +1,8 @@
+# Link map of _start
+# .main
+#>02000000          SDK_STATIC_START (linker command file)
+  02000CA4 00000000 .text   $t	(src_game.c.o)
+  02000CA4 000001C8 .text   GameMain	(src_game.c.o)
+  02000E48 00000000 .text   $d	(src_game.c.o)
+  02000C88 0000001C .version .version	(libnet.a asm_net_)
+  02100010 00000038 .text   DoThing	(asm_things.s.o)

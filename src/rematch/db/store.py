@@ -40,18 +40,38 @@ def schema_version(conn: sqlite3.Connection) -> int:
 
 
 def migrate(conn: sqlite3.Connection) -> int:
-    """Apply pending migrations, each in its own transaction. Returns how many ran."""
+    """Apply pending migrations, each in its own transaction. Returns how many ran.
+
+    Foreign keys are off while a migration runs, so it can rebuild a referenced table (SQLite
+    cannot alter constraints in place). They are checked before commit, and any violation
+    rolls the migration back.
+    """
     current = schema_version(conn)
     available = migrations()
     if current > len(available):
         raise MigrationError(
             f"database is at version {current}, newer than this rematch ({len(available)})"
         )
+    fk_enabled = conn.execute("PRAGMA foreign_keys").fetchone()[0]
     applied = 0
-    for number, path in available[current:]:
-        sql = path.read_text(encoding="utf-8")
-        conn.executescript(f"BEGIN;\n{sql}\nPRAGMA user_version = {number};\nCOMMIT;")
-        applied += 1
+    try:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        for number, path in available[current:]:
+            sql = path.read_text(encoding="utf-8")
+            try:
+                conn.executescript(f"BEGIN;\n{sql}\n")
+                problems = conn.execute("PRAGMA foreign_key_check").fetchall()
+                if problems:
+                    raise MigrationError(f"{path.name}: foreign key violations {problems[:5]}")
+                conn.execute(f"PRAGMA user_version = {number}")
+                conn.execute("COMMIT")
+            except (sqlite3.Error, MigrationError):
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
+            applied += 1
+    finally:
+        conn.execute(f"PRAGMA foreign_keys = {'ON' if fk_enabled else 'OFF'}")
     return applied
 
 

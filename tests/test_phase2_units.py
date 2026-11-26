@@ -380,6 +380,7 @@ def test_prompts_render() -> None:
         previous_best_score=None,
         max_checks=40,
         version_cond=True,
+        asm_target=True,
         target_s="\tbx lr",
         declarations="void sub_1(void);",
         ctx_kb=1000,

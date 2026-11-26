@@ -56,6 +56,8 @@ def function_view(obj: ObjectFile, name: str, lines: list[Line], self_name: str)
     section = obj.sections[sym.section]
     code = bytearray(section.data[sym.value : sym.value + sym.size])
     mnemonic_at = {line.offset: line.mnemonic.split(".")[0] for line in lines}
+    # pool words keep the name the lines show (it may come from the assembly source)
+    word_target = {ln.offset: ln.reloc for ln in lines if ln.mnemonic == ".word" and ln.reloc}
     entries: dict[int, RelocEntry] = {}
     for r in section.relocs:
         if not sym.value <= r.offset < sym.value + sym.size:
@@ -65,7 +67,7 @@ def function_view(obj: ObjectFile, name: str, lines: list[Line], self_name: str)
             target = describe_target(obj, r.symbol, r.addend + _CALL_TYPES[r.type], self_name)
             kind = f"call:{mnemonic_at.get(off, 'bl')}"
         else:
-            target = describe_target(obj, r.symbol, r.addend, self_name)
+            target = word_target.get(off) or describe_target(obj, r.symbol, r.addend, self_name)
             kind = r.type
         entries[off] = RelocEntry(off, kind, target)
         code[off : off + r.width] = bytes(r.width)

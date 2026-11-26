@@ -35,5 +35,10 @@ Budget: at most {{ max_checks }} runs of ./check. Stop early if you match.
 {% if version_cond %}
 This function is checked against every target version.
 {% endif %}
+{% if asm_target %}
+Data that target.s loads from its literal pool by name (`ldr rN, =NAME`) is defined in the
+assembly file, which stays as it is. Declare it `extern` with exactly that name and a fitting
+type; don't define it in candidate.c.
+{% endif %}
 
 Write the function {{ symbol }} in candidate.c, run ./check, iterate to MATCH.

@@ -6,4 +6,5 @@
 # 5: similarity-ranked examples, none decompiled with or after a bench target (Phase 3, B1).
 # 6: m2c draft.c seeds candidate.c when M2C is set (Phase 3, B2).
 # 7: LEARNINGS = rematch's generic rules + the target's .rematch/LEARNINGS.md (Phase 3, B3).
-CONTEXT_VERSION = 7
+# 8: live asm targets: pool words named from the asm source, padding trimmed, extern-data note.
+CONTEXT_VERSION = 8

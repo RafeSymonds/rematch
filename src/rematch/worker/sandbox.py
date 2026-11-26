@@ -142,6 +142,15 @@ def make_context(s: Session, version: str, stub: Path, entry: CompileEntry) -> s
     return result.stdout
 
 
+def asm_function_text(s: Session, fn: FunctionRecord, tu_text: str) -> str | None:
+    if fn.source_kind != "asm" or s.definition.asm is None:
+        return None
+    for f in asm_parser.PARSERS[s.definition.asm.format](tu_text):
+        if f.name == fn.name:
+            return f.text
+    return None
+
+
 def render_target(
     fn: FunctionRecord, lines: list[Line], tu_text: str, asm_format: str | None
 ) -> str:
@@ -186,12 +195,41 @@ def _rename(text: str, old: str, new: str) -> str:
     return re.sub(rf"\b{re.escape(old)}\b", new, text)
 
 
-def _vanilla_lines(s: Session, obj_path: Path, name: str) -> tuple[ObjectFile, list[Line]]:
+def _vanilla_lines(
+    s: Session, obj_path: Path, name: str, asm_text: str | None = None
+) -> tuple[ObjectFile, list[Line]]:
+    """The target's normalized lines. For an assembly function, `asm_text` (its source) names
+    literal-pool words that point at labels local to the assembly file."""
     obj = read_object(obj_path)
-    lines = disassemble(run_objdump(s.settings.objdump, obj.path), obj).get(name)
+    text = run_objdump(s.settings.objdump, obj.path)
+    lines = disassemble(text, obj).get(name)
     if lines is None:
         raise SandboxError(f"{name} not found in {obj_path}")
+    names = asm_pool_names(asm_text, lines) if asm_text else {}
+    if names:
+        lines = disassemble(text, obj, pool_names={name: names})[name]
     return obj, lines
+
+
+_WORD = re.compile(r"^\s*(?:[\w.$]+:\s*)?\.word\s+([^;@]+?)\s*(?:[;@].*)?$")
+_SYMBOL_EXPR = re.compile(r"^([A-Za-z_.$][\w.$]*)\s*(?:([+-])\s*(0x[0-9a-fA-F]+|\d+))?$")
+
+
+def asm_pool_names(asm_text: str, lines: list[Line]) -> dict[int, str]:
+    """Offset -> name for the target's `.word` lines, from the source's `.word` operands in
+    order. Empty when the counts disagree (then anonymous targets compare by content)."""
+    exprs = [m.group(1) for m in map(_WORD.match, asm_text.splitlines()) if m]
+    words = [ln for ln in lines if ln.mnemonic == ".word"]
+    if len(exprs) != len(words):
+        return {}
+    out: dict[int, str] = {}
+    for ln, expr in zip(words, exprs, strict=True):
+        m = _SYMBOL_EXPR.match(expr.strip())
+        if m is None:
+            continue
+        addend = int(m.group(3), 0) * (-1 if m.group(2) == "-" else 1) if m.group(3) else 0
+        out[ln.offset] = m.group(1) + (f"{addend:+#x}" if addend else "")
+    return out
 
 
 def write_examples(s: Session, examples: tuple[FunctionRecord, ...], out: Path) -> list[str]:
@@ -242,6 +280,7 @@ def build_sandbox(
     build = s.definition.require(s.definition.build_info, "build")
     versions = s.target.versions() if fn.version_cond else [s.primary_version]
     tu_text = (s.worktree / fn.tu_path).read_text(encoding="utf-8", errors="replace")
+    asm_source = asm_function_text(s, fn, tu_text)
     symbol = anonymous_name(s, fn.module, fn.address) if opts.bench else fn.name
     index = (
         HeaderIndex.from_json(s.header_index_path.read_text(encoding="utf-8"))
@@ -256,7 +295,7 @@ def build_sandbox(
         db = CompileDB.load(build_dir / build.compile_commands, s.worktree)
         tu_entry = db.entry(fn.tu_path)
         entry = tu_entry if fn.source_kind == "c_human" else db.c_template_for(fn.tu_path)
-        obj, lines = _vanilla_lines(s, tu_entry.object_path, fn.name)
+        obj, lines = _vanilla_lines(s, tu_entry.object_path, fn.name, asm_source)
         save_target(control, version, lines, function_view(obj, fn.name, lines, fn.name))
         if i == 0:
             primary_lines = lines
@@ -355,6 +394,7 @@ def build_sandbox(
                 previous_best_score=None,
                 max_checks=s.settings.max_checks,
                 version_cond=fn.version_cond,
+                asm_target=fn.source_kind == "asm",
                 target_s=target_s.rstrip("\n"),
                 declarations=decls,
                 ctx_kb=(out / "ctx.h").stat().st_size // 1024,

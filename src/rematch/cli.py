@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -56,11 +57,18 @@ def doctor() -> None:
 
 
 @app.command()
-def inventory() -> None:
+def inventory(
+    history: bool = typer.Option(
+        False, "--history", help="Compute decompiled_at for human C (needs a prior inventory)."
+    ),
+) -> None:
     """Parse the vanilla build: every linked function, its features and difficulty, into the DB."""
     from rematch.inventory.run import run_inventory
 
     s = _session()
+    if history:
+        _inventory_history(s)
+        return
     conn = store.connect(s.db_path)
     try:
         report, log_path = run_inventory(
@@ -118,14 +126,20 @@ def ctx(
     with_source: bool = typer.Option(
         False, help="Seed candidate.c with the human C (c_human only; never for bench)."
     ),
+    bench: bool = typer.Option(False, help="Bench presentation: anonymous name, scrubbed ctx."),
 ) -> None:
     """Build a sandbox for one function without running a worker."""
-    from rematch.worker.sandbox import SandboxError, build_sandbox, find_function
+    from rematch.worker.sandbox import SandboxError, SandboxOptions, build_sandbox, find_function
 
     s = _session()
     conn = store.connect(s.db_path)
     try:
-        task = build_sandbox(s, find_function(conn, function), out, with_source)
+        task = build_sandbox(
+            s,
+            find_function(conn, function),
+            out,
+            SandboxOptions(with_source=with_source, bench=bench),
+        )
     except SandboxError as exc:
         typer.echo(f"FAIL {exc}")
         raise typer.Exit(1) from exc
@@ -184,3 +198,199 @@ def roundtrip(
     typer.echo(f"log: {log_path}")
     if summary["ok"] != summary["total"]:
         raise typer.Exit(1)
+
+
+def _inventory_history(s: Session) -> None:
+    from rematch.inventory.history import HistoryError, run_history, targets_from_db
+
+    order = s.definition.require(s.definition.link_order, "link_order")
+    asm = s.definition.require(s.definition.asm, "asm")
+    conn = store.connect(s.db_path)
+    try:
+        targets, unresolved = targets_from_db(s.definition, s.worktree, conn, s.primary_version)
+        dates, report = run_history(
+            s.settings.target_repo,
+            s.settings.target_pin,
+            s.settings.bench_cutoff_date,
+            [order.file, *order.history],
+            asm.format,
+            targets,
+            _echo_err,
+        )
+        with conn:
+            conn.execute("UPDATE functions SET decompiled_at = NULL WHERE source_kind = 'c_human'")
+            conn.executemany(
+                "UPDATE functions SET decompiled_at = ? WHERE id = ?",
+                [(c.date, fid) for fid, c in dates.items()],
+            )
+    except HistoryError as exc:
+        typer.echo(f"FAIL history: {exc}")
+        raise typer.Exit(1) from exc
+    finally:
+        conn.close()
+    report.no_address = unresolved
+    log_dir = s.settings.rematch_var / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+    path = log_dir / f"history-{stamp}.json"
+    path.write_text(json.dumps(dataclasses.asdict(report), indent=2), encoding="utf-8")
+    typer.echo(f"cutoff commit {report.cutoff_commit[:12]} ({report.cutoff_date})")
+    typer.echo(f"human-C functions: {report.c_functions} (+{unresolved} without an address)")
+    typer.echo(f"decompiled after the cutoff (clean pool before pre-screen): {report.dated}")
+    typer.echo(f"commits read: {report.commits_read} of {report.commits_after}")
+    typer.echo(f"log: {path}")
+
+
+def _confirm_spend(what: str, attempts: int, yes: bool) -> None:
+    """Token-spending commands print an estimate and need --yes or a TTY confirmation (§13)."""
+    import sys
+
+    s = _settings()
+    typer.echo(
+        f"{what}: {attempts} worker attempt(s), each up to {s.max_turns} turns, "
+        f"{s.max_checks} checks and {s.attempt_timeout_sec:g} s ({s.worker_auth_mode} auth)."
+    )
+    if yes:
+        return
+    if not sys.stdin.isatty() or not typer.confirm("This spends model tokens. Continue?"):
+        typer.echo("Not confirmed. Pass --yes to run.")
+        raise typer.Exit(2)
+
+
+def _model_effort(model: str | None, effort: str | None) -> tuple[str, str]:
+    s = _settings()
+    return model or s.worker_model, effort or s.worker_effort
+
+
+@app.command()
+def selftest(
+    n: int = typer.Option(10, help="Functions for the oracle run."),
+    workers: int = typer.Option(4, help="Parallel attempts."),
+) -> None:
+    """Oracle + saboteur fake agents through the full pipeline; zero model calls (§14)."""
+    from rematch.selftest.run import run_selftest
+
+    s = _session()
+    checks = run_selftest(s, n, workers, _echo_err)
+    for c in checks:
+        typer.echo(f"{'PASS' if c.ok else 'FAIL'} {c.name}: {c.detail}")
+    if not all(c.ok for c in checks):
+        raise typer.Exit(1)
+
+
+@app.command()
+def bench(
+    n: int = typer.Option(..., help="Set size."),
+    seed: int = typer.Option(42),
+    pool: str = typer.Option("clean", help="clean or contaminated (§11.1)."),
+    workers: int | None = typer.Option(None, help="Parallel attempts (default WORKER_COUNT)."),
+    model: str | None = typer.Option(None),
+    effort: str | None = typer.Option(None),
+    yes: bool = typer.Option(False, "--yes", help="Confirm token spend."),
+) -> None:
+    """Run a frozen bench set with real workers (spends tokens)."""
+    from rematch.bench.pool import Prescreen, pool_sizes
+    from rematch.bench.report import append_row, benchmarks_row, format_report, run_metrics
+    from rematch.bench.run import run_functions
+    from rematch.bench.sets import load_set, save_set, set_id, stratified_sample
+    from rematch.target.definition import target_dir
+    from rematch.worker.sandbox import find_function
+
+    if pool not in ("clean", "contaminated"):
+        typer.echo("--pool must be clean or contaminated")
+        raise typer.Exit(2)
+    s = _session()
+    cutoff = s.settings.bench_cutoff_date
+    sid = set_id(n, seed, cutoff) + ("" if pool == "clean" else "-contaminated")
+    conn = store.connect(s.db_path)
+    try:
+        ids = load_set(conn, sid)
+        if ids is None:
+            sizes = pool_sizes(conn, pool, cutoff)
+            typer.echo(f"pool {pool}: {len(sizes)} functions; building set {sid}")
+            prescreen = Prescreen(s, conn, _echo_err, s.settings.worker_count)
+            ids, rejected = stratified_sample(sizes, n, seed, prescreen.eligible)
+            save_set(conn, sid, ids, seed, cutoff)
+            typer.echo(f"set {sid}: {len(ids)} functions ({len(rejected)} failed the pre-screen)")
+        fns = []
+        for fid in ids:
+            module, address = conn.execute(
+                "SELECT module, address FROM functions WHERE id = ?", (fid,)
+            ).fetchone()
+            fns.append(find_function(conn, f"{module}:{address:#x}"))
+    finally:
+        conn.close()
+    m, e = _model_effort(model, effort)
+    _confirm_spend(f"bench {sid}", len(fns), yes)
+    result = run_functions(
+        s,
+        "bench",
+        fns,
+        model=m,
+        effort=e,
+        workers=workers or s.settings.worker_count,
+        bench=True,
+        seed=seed,
+        log=_echo_err,
+        bench_set=sid,
+    )
+    conn = store.connect(s.db_path)
+    try:
+        metrics = run_metrics(conn, result.run_id)
+    finally:
+        conn.close()
+    typer.echo(format_report(metrics))
+    row = benchmarks_row(metrics, s.definition.name, "baseline" if seed == 42 else "")
+    path = append_row(target_dir(s.settings.target_repo), row)
+    typer.echo(f"row appended to {path}")
+
+
+@app.command()
+def attempt(
+    function: str = typer.Argument(..., help="Name, 0xADDR or module:0xADDR."),
+    model: str | None = typer.Option(None),
+    effort: str | None = typer.Option(None),
+    yes: bool = typer.Option(False, "--yes", help="Confirm token spend."),
+) -> None:
+    """One live attempt on one function (spends tokens)."""
+    from rematch.bench.run import run_functions
+    from rematch.worker.sandbox import find_function
+
+    s = _session()
+    conn = store.connect(s.db_path)
+    try:
+        fn = find_function(conn, function)
+    finally:
+        conn.close()
+    m, e = _model_effort(model, effort)
+    _confirm_spend(f"attempt {fn.name}", 1, yes)
+    result = run_functions(
+        s, "live", [fn], model=m, effort=e, workers=1, bench=False, seed=0, log=_echo_err
+    )
+    attempt_id, _, c = result.attempts[0]
+    typer.echo(f"attempt {attempt_id}: {c.outcome} (best {c.best_score})")
+
+
+@app.command()
+def report(
+    run: int | None = typer.Option(None, help="Run id (default: the last run)."),
+    compare: int | None = typer.Option(None, help="Another run to show next to it."),
+) -> None:
+    """Metrics for a run (§11.3)."""
+    from rematch.bench.report import format_report, run_metrics
+
+    s = _session()
+    conn = store.connect(s.db_path)
+    try:
+        run_id = run
+        if run_id is None:
+            row = conn.execute("SELECT max(id) FROM runs").fetchone()
+            run_id = row[0] if row else None
+        if run_id is None:
+            typer.echo("no runs yet")
+            raise typer.Exit(1)
+        typer.echo(format_report(run_metrics(conn, run_id)))
+        if compare is not None:
+            typer.echo(format_report(run_metrics(conn, compare)))
+    finally:
+        conn.close()

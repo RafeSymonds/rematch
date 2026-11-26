@@ -57,7 +57,8 @@ class Settings(BaseSettings):
     @field_validator("target_repo", "rematch_db", "rematch_var", "rematch_workdir", mode="after")
     @classmethod
     def _expand_user(cls, value: Path | None) -> Path | None:
-        return None if value is None else value.expanduser()
+        # Absolute from here on: these paths are handed to processes running in sandboxes.
+        return None if value is None else value.expanduser().resolve()
 
     def version_override(self) -> list[str]:
         """`TARGET_VERSIONS` as a list. Empty means use target.toml `default_versions`."""

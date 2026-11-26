@@ -5,22 +5,27 @@ Phase 2 adds TASK.md, examples/, LEARNINGS.md, read-only inputs and hashing.
 
 from __future__ import annotations
 
+import hashlib
+import re
 import sqlite3
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from rematch import prompts
 from rematch.context.header_index import HeaderIndex
 from rematch.diff.match import function_view
 from rematch.diff.objdump_backend import Line, disassemble, run_objdump
-from rematch.inventory import asm_parser
-from rematch.inventory.c_parser import function_source, tu_local_context
+from rematch.inventory import asm_parser, link_order
+from rematch.inventory.c_parser import function_source, strip_comments, tu_local_context
 from rematch.session import Session
 from rematch.target.definition import target_dir
 from rematch.toolchain.compile_db import CompileDB
-from rematch.toolchain.objects import read_object
+from rematch.toolchain.objects import ObjectFile, read_object
 from rematch.worker.check_entry import save_target
 from rematch.worker.task import CompileSpec, Task, VersionTask
+
+LEARNINGS = Path(__file__).resolve().parents[3] / "docs" / "LEARNINGS.md"
 
 
 class SandboxError(Exception):
@@ -120,13 +125,74 @@ def check_script() -> str:
     return f'#!/bin/sh\nexec "{rematch}" cd --sandbox "$(cd "$(dirname "$0")" && pwd)" "$@"\n'
 
 
-def build_sandbox(s: Session, fn: FunctionRecord, out: Path, with_source: bool) -> Task:
+@dataclass(frozen=True)
+class SandboxOptions:
+    with_source: bool = False  # seed candidate.c with the human C (round-trip/oracle only)
+    bench: bool = False  # §7.2: anonymous symbol, scrubbed context
+    examples: tuple[FunctionRecord, ...] = ()
+    task_md: bool = True
+
+
+def anonymous_name(s: Session, module: str, address: int) -> str:
+    """The target's anonymous name for a function (target.toml [naming], SPEC §7.2)."""
+    order = s.definition.require(s.definition.link_order, "link_order")
+    tus = link_order.PARSERS[order.format]((s.worktree / order.file).read_text(encoding="utf-8"))
+    overlay = next((tu.overlay for tu in tus if tu.module == module), None)
+    naming = s.definition.naming
+    if overlay is not None:
+        return naming.overlay_anonymous.format(address=address, overlay=overlay, module=module)
+    return naming.anonymous.format(address=address, module=module)
+
+
+def _rename(text: str, old: str, new: str) -> str:
+    return re.sub(rf"\b{re.escape(old)}\b", new, text)
+
+
+def _vanilla_lines(s: Session, obj_path: Path, name: str) -> tuple[ObjectFile, list[Line]]:
+    obj = read_object(obj_path)
+    lines = disassemble(run_objdump(s.settings.objdump, obj.path), obj).get(name)
+    if lines is None:
+        raise SandboxError(f"{name} not found in {obj_path}")
+    return obj, lines
+
+
+def write_examples(s: Session, examples: tuple[FunctionRecord, ...], out: Path) -> list[str]:
+    """examples/NN_<name>.c and .s for matched functions (SPEC §6.7)."""
+    if not examples:
+        return []
+    build = s.definition.require(s.definition.build_info, "build")
+    db = CompileDB.load(
+        s.definition.build_dir(s.worktree, s.primary_version) / build.compile_commands, s.worktree
+    )
+    folder = out / "examples"
+    folder.mkdir()
+    names: list[str] = []
+    for i, ex in enumerate(examples):
+        text = (s.worktree / ex.tu_path).read_text(encoding="utf-8", errors="replace")
+        source = function_source(text, ex.name)
+        if source is None:
+            continue
+        _, lines = _vanilla_lines(s, db.entry(ex.tu_path).object_path, ex.name)
+        stem = f"{i:02d}_{ex.name}"
+        (folder / f"{stem}.c").write_text(source + "\n", encoding="utf-8")
+        (folder / f"{stem}.s").write_text(render_target(ex, lines, text, None), encoding="utf-8")
+        names.append(stem)
+    return names
+
+
+def build_sandbox(
+    s: Session, fn: FunctionRecord, out: Path, options: SandboxOptions | None = None
+) -> Task:
+    opts = options or SandboxOptions()
     if out.exists() and any(out.iterdir()):
         raise SandboxError(f"{out} exists and is not empty")
+    if opts.bench and fn.source_kind != "c_human":
+        raise SandboxError("bench mode needs a human-C target")
     out.mkdir(parents=True, exist_ok=True)
     build = s.definition.require(s.definition.build_info, "build")
     versions = s.target.versions() if fn.version_cond else [s.primary_version]
     tu_text = (s.worktree / fn.tu_path).read_text(encoding="utf-8", errors="replace")
+    symbol = anonymous_name(s, fn.module, fn.address) if opts.bench else fn.name
     index = (
         HeaderIndex.from_json(s.header_index_path.read_text(encoding="utf-8"))
         if s.header_index_path.is_file()
@@ -140,10 +206,7 @@ def build_sandbox(s: Session, fn: FunctionRecord, out: Path, with_source: bool) 
         db = CompileDB.load(build_dir / build.compile_commands, s.worktree)
         tu_entry = db.entry(fn.tu_path)
         entry = tu_entry if fn.source_kind == "c_human" else db.c_template_for(fn.tu_path)
-        obj = read_object(tu_entry.object_path)
-        lines = disassemble(run_objdump(s.settings.objdump, obj.path), obj).get(fn.name)
-        if lines is None:
-            raise SandboxError(f"{fn.name} not found in {tu_entry.object_path}")
+        obj, lines = _vanilla_lines(s, tu_entry.object_path, fn.name)
         save_target(out, version, lines, function_view(obj, fn.name, lines, fn.name))
         if i == 0:
             primary_lines = lines
@@ -152,8 +215,14 @@ def build_sandbox(s: Session, fn: FunctionRecord, out: Path, with_source: bool) 
         stub = out / f".ctx_stub.{version}.c"
         stub.write_text(context_stub(s, fn, tu_text, callees, index), encoding="utf-8")
         ctx = make_context(s, version, stub)
+        stub.unlink()
         if fn.source_kind == "c_human":
-            ctx += "\n/* TU-local declarations */\n" + tu_local_context(tu_text, fn.name)
+            local = tu_local_context(tu_text, fn.name)
+            if opts.bench:
+                local = strip_comments(local)  # comments may describe or name the target
+            ctx += "\n/* TU-local declarations */\n" + local
+        if opts.bench:
+            ctx = _rename(ctx, fn.name, symbol)
         ctx_name = "ctx.h" if i == 0 else f"ctx.{version}.h"
         (out / ctx_name).write_text(ctx, encoding="utf-8")
         version_tasks.append(
@@ -166,18 +235,48 @@ def build_sandbox(s: Session, fn: FunctionRecord, out: Path, with_source: bool) 
         )
 
     asm_format = s.definition.asm.format if s.definition.asm else None
-    (out / "target.s").write_text(render_target(fn, primary_lines, tu_text, asm_format))
-    source = function_source(tu_text, fn.name) if with_source else None
-    if with_source and source is None:
-        raise SandboxError(f"no C source for {fn.name} in {fn.tu_path}")
-    candidate = source + "\n" if source else f"// Write {fn.name} here.\n"
+    shown = FunctionRecord(
+        fn.id, symbol, fn.address, fn.module, fn.tu_path, fn.source_kind, fn.mode, fn.version_cond
+    )
+    (out / "target.s").write_text(render_target(shown, primary_lines, tu_text, asm_format))
+    if opts.with_source:
+        source = function_source(tu_text, fn.name)
+        if source is None:
+            raise SandboxError(f"no C source for {fn.name} in {fn.tu_path}")
+        candidate = _rename(source, fn.name, symbol) + "\n"
+    else:
+        candidate = f"// Write {symbol} here. Its prototype, if known, is in ctx.h.\n"
     (out / "candidate.c").write_text(candidate, encoding="utf-8")
+    (out / "NOTES.md").write_text("", encoding="utf-8")
+    # Claude Code denies Write on a file that doesn't exist yet even when the path is allowed,
+    # so the worker's report file exists from the start.
+    (out / "SUMMARY.json").write_text("{}\n", encoding="utf-8")
     check = out / "check"
     check.write_text(check_script(), encoding="utf-8")
     check.chmod(0o755)
 
+    example_names = write_examples(s, opts.examples, out)
+    (out / "LEARNINGS.md").write_text(LEARNINGS.read_text(encoding="utf-8"), encoding="utf-8")
+    if opts.task_md:
+        (out / "TASK.md").write_text(
+            prompts.render(
+                "task.md.j2",
+                symbol=symbol,
+                mode=fn.mode,
+                n_insns=sum(1 for ln in primary_lines if not ln.is_data),
+                module=fn.module,
+                examples=example_names,
+                draft=None,
+                previous_best=None,
+                previous_best_score=None,
+                max_checks=s.settings.max_checks,
+                version_cond=fn.version_cond,
+            ),
+            encoding="utf-8",
+        )
+
     task = Task(
-        symbol=fn.name,
+        symbol=symbol,
         target_symbol=fn.name,
         tu=fn.tu_path,
         module=fn.module,
@@ -191,3 +290,47 @@ def build_sandbox(s: Session, fn: FunctionRecord, out: Path, with_source: bool) 
     )
     task.save(out)
     return task
+
+
+# --- read-only inputs and the hash manifest (SPEC §7.1) --------------------------------
+
+WRITABLE = frozenset({"candidate.c", "NOTES.md", "SUMMARY.json"})
+HISTORY_DIR = ".history"
+
+
+def _sealed_files(sandbox: Path) -> list[Path]:
+    out: list[Path] = []
+    for path in sorted(sandbox.rglob("*")):
+        rel = path.relative_to(sandbox)
+        if rel.parts[0] == HISTORY_DIR or rel.as_posix() in WRITABLE:
+            continue
+        if path.is_file() or path.is_symlink():
+            out.append(path)
+    return out
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def seal(sandbox: Path) -> dict[str, str]:
+    """Make every input read-only and return its SHA-256 manifest (store it outside)."""
+    manifest: dict[str, str] = {}
+    for path in _sealed_files(sandbox):
+        manifest[path.relative_to(sandbox).as_posix()] = _sha256(path)
+        path.chmod(0o555 if path.name == "check" else 0o444)
+    return manifest
+
+
+def verify_seal(sandbox: Path, manifest: dict[str, str]) -> list[str]:
+    """Inputs that changed, disappeared or appeared since `seal`."""
+    problems: list[str] = []
+    current = {p.relative_to(sandbox).as_posix(): p for p in _sealed_files(sandbox)}
+    for rel, digest in manifest.items():
+        path = current.get(rel)
+        if path is None:
+            problems.append(f"missing {rel}")
+        elif _sha256(path) != digest:
+            problems.append(f"modified {rel}")
+    problems += [f"added {rel}" for rel in sorted(set(current) - set(manifest))]
+    return problems

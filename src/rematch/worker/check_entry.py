@@ -21,6 +21,7 @@ from rematch.inventory.c_parser import mask, parse_c_functions
 from rematch.toolchain.compile import compile_candidate, scratch_source
 from rematch.toolchain.objects import read_object
 from rematch.toolchain.runner import ToolchainRunner
+from rematch.types.provisional import check_block
 from rematch.worker.task import Task
 
 HISTORY = ".history"
@@ -33,6 +34,7 @@ _FORBIDDEN = (
 )
 _INCLUDE = re.compile(r'^\s*#\s*include\s*(?P<what>[<"][^>"]*[>"])', re.MULTILINE)
 _COMMENTS = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
+_OWN_CTX_INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"ctx\.h"[^\n]*$', re.MULTILINE)
 
 
 # --- target cache (written by the sandbox builder) -----------------------------------
@@ -143,6 +145,67 @@ def stop_line(reason: str) -> str:
 # --- the check -----------------------------------------------------------------------
 
 
+def evaluate(
+    sandbox: Path, task: Task, candidate: str, build: Path
+) -> tuple[str | None, list[str], list[VersionResult]]:
+    """Pre-filter, compile and diff `candidate` for every required version.
+
+    Returns (rejection reason, compile errors, per-version results). No state is touched, so
+    the orchestrator can re-verify a candidate this way (SPEC §7.4).
+    """
+    rejected = prefilter(candidate, task.symbol)
+    if rejected is None:
+        ctx_text = (sandbox / task.versions[0].ctx).read_text(encoding="utf-8", errors="replace")
+        rejected = check_block(candidate, ctx_text)
+    if rejected is not None:
+        return rejected, [], []
+    runner = ToolchainRunner.from_spec(task.toolchain_exec)
+    build.mkdir(parents=True, exist_ok=True)
+    rel_ctx = Path(*([".."] * len(build.relative_to(sandbox).parts)))
+    results: list[VersionResult] = []
+    # The scratch file includes the context itself; a candidate's own `#include "ctx.h"`
+    # (allowed, and common) would resolve from the build directory, so blank it out in place.
+    body = _OWN_CTX_INCLUDE.sub("", candidate)
+    for vt in task.versions:
+        scratch = build / f"scratch.{vt.version}.c"
+        scratch.write_text(
+            scratch_source(body, (rel_ctx / vt.ctx).as_posix())
+            + keep_reference(candidate, task.symbol),
+            encoding="utf-8",
+        )
+        compiled = compile_candidate(
+            vt.compile.entry(),
+            runner,
+            scratch,
+            build / f"candidate.{vt.version}.o",
+            task.compile_timeout,
+        )
+        if not compiled.ok:
+            return None, list(compiled.errors), []
+        cobj = read_object(compiled.object_path)
+        clines = disassemble(
+            run_objdump(task.objdump, compiled.object_path), cobj, {task.symbol: task.symbol}
+        ).get(task.symbol)
+        if clines is None:
+            return None, [f"{task.symbol} was not emitted by the compiler"], []
+        tlines, tview = load_target(sandbox, vt.version)
+        m = binary_match(tview, function_view(cobj, task.symbol, clines, task.symbol))
+        ops = align(tlines, clines)
+        results.append(
+            VersionResult(
+                vt.version,
+                m.match,
+                score(ops, len(tlines), len(clines)),
+                sum(1 for x in tlines if not x.is_data),
+                sum(1 for x in clines if not x.is_data),
+                ops,
+                hints(ops, task.mode),
+                m.reasons,
+            )
+        )
+    return None, [], results
+
+
 def run_check(sandbox: Path, json_out: Path | None = None) -> tuple[str, int, CheckResult | None]:
     start = time.perf_counter()
     task = Task.load(sandbox)
@@ -157,56 +220,11 @@ def run_check(sandbox: Path, json_out: Path | None = None) -> tuple[str, int, Ch
     candidate = (sandbox / "candidate.c").read_text(encoding="utf-8", errors="replace")
     (sandbox / HISTORY / f"{n:03d}.c").write_text(candidate, encoding="utf-8")
 
-    rejected = prefilter(candidate, task.symbol)
+    rejected, errors, results = evaluate(sandbox, task, candidate, sandbox / HISTORY / "build")
     if rejected is not None:
         result = CheckResult(n, "rejected", 0.0, False, 0.0, reason=rejected)
         text = f"check {n}/{task.max_checks} | REJECTED: {rejected}"
         return _finish(sandbox, task, state, result, text, start, json_out)
-
-    runner = ToolchainRunner.from_spec(task.toolchain_exec)
-    results: list[VersionResult] = []
-    errors: list[str] = []
-    for vt in task.versions:
-        scratch = sandbox / f"scratch.{vt.version}.c"
-        scratch.write_text(
-            scratch_source(candidate, vt.ctx) + keep_reference(candidate, task.symbol),
-            encoding="utf-8",
-        )
-        compiled = compile_candidate(
-            vt.compile.entry(),
-            runner,
-            scratch,
-            sandbox / f"candidate.{vt.version}.o",
-            task.compile_timeout,
-        )
-        if not compiled.ok:
-            errors = list(compiled.errors)
-            break
-        cobj = read_object(compiled.object_path)
-        clines = disassemble(
-            run_objdump(task.objdump, compiled.object_path), cobj, {task.symbol: task.symbol}
-        ).get(task.symbol)
-        if clines is None:
-            errors = [f"{task.symbol} was not emitted by the compiler"]
-            break
-        tlines, tview = load_target(sandbox, vt.version)
-        cview = function_view(cobj, task.symbol, clines, task.symbol)
-        m = binary_match(tview, cview)
-        ops = align(tlines, clines)
-        n_t = sum(1 for x in tlines if not x.is_data)
-        n_c = sum(1 for x in clines if not x.is_data)
-        results.append(
-            VersionResult(
-                vt.version,
-                m.match,
-                score(ops, len(tlines), len(clines)),
-                n_t,
-                n_c,
-                ops,
-                hints(ops, task.mode),
-                m.reasons,
-            )
-        )
 
     if errors:
         result = CheckResult(n, "compile_fail", 0.0, False, 0.0, errors=errors)

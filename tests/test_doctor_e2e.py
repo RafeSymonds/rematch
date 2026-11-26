@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 
 from rematch.cli import app
 from rematch.config import Settings
-from rematch.doctor import CheckResult, iter_doctor
+from rematch.doctor import CheckResult, iter_doctor, set_writable
 from tests.helpers import FORBIDDEN, git, make_target_repo
 
 
@@ -52,6 +52,7 @@ def test_all_pass_and_builds_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         "build alpha",
         "build beta",
         "required paths",
+        "vanilla read-only",
         "objdump",
         "ctags",
         "database",
@@ -86,7 +87,11 @@ def test_tampered_rom_fails(tmp_path: Path) -> None:
     repo, pin = make_target_repo(tmp_path)
     settings = settings_for(tmp_path, repo, pin)
     run(settings)
-    (tmp_path / "demo-vanilla" / "out" / "beta.bin").write_bytes(b"tampered")
+    vanilla = tmp_path / "demo-vanilla"
+    with pytest.raises(PermissionError):  # doctor left the answer key read-only
+        (vanilla / "out" / "beta.bin").write_bytes(b"tampered")
+    set_writable(vanilla, writable=True)
+    (vanilla / "out" / "beta.bin").write_bytes(b"tampered")
     results = run(settings)
     assert failures(results) == {"build beta"}
     assert "expected" in results["build beta"].detail
@@ -114,6 +119,7 @@ def test_dirty_vanilla_worktree_fails(tmp_path: Path) -> None:
     repo, pin = make_target_repo(tmp_path)
     settings = settings_for(tmp_path, repo, pin)
     run(settings)
+    set_writable(tmp_path / "demo-vanilla", writable=True)
     (tmp_path / "demo-vanilla" / "build.sh").write_text("echo edited\n")
     assert failures(run(settings)) == {"vanilla worktree"}
 
@@ -173,7 +179,7 @@ def test_cli_exit_codes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     cli = CliRunner()
     ok = cli.invoke(app, ["doctor"])
     assert ok.exit_code == 0, ok.output
-    assert ok.output.count("PASS") == 13
+    assert ok.output.count("PASS") == 14
 
     monkeypatch.delenv("TARGET_PIN")
     bad = cli.invoke(app, ["doctor"])

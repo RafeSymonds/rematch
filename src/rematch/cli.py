@@ -431,3 +431,62 @@ def _effort_by_size(s: Session, ids: list[int]) -> dict[int, str]:
     finally:
         conn.close()
     return {int(fid): s.settings.effort_for_size(bucket(int(n or 0))) for fid, n in rows}
+
+
+learnings_app = typer.Typer(no_args_is_help=True, help="Curate worker-proposed learnings (D9).")
+app.add_typer(learnings_app, name="learnings")
+
+
+@learnings_app.command("review")
+def learnings_review(
+    list_only: bool = typer.Option(False, "--list", help="Print pending candidates and exit."),
+    accept: list[int] = typer.Option([], "--accept", help="Candidate ids to accept."),
+    to: str = typer.Option("generic", "--to", help="generic (rematch) or target (.rematch/)."),
+    reject: list[int] = typer.Option([], "--reject", help="Candidate ids to reject."),
+) -> None:
+    """Accept or reject learning candidates; accepted ones go into a LEARNINGS.md."""
+    import sys
+
+    from rematch.learnings.curate import MAX_LINES, append_rule, decide, line_count, pending
+    from rematch.target.definition import target_dir
+    from rematch.worker.sandbox import LEARNINGS
+
+    s = _session()
+    files = {"generic": LEARNINGS, "target": target_dir(s.settings.target_repo) / "LEARNINGS.md"}
+    if to not in files:
+        typer.echo("--to must be generic or target")
+        raise typer.Exit(2)
+    conn = store.connect(s.db_path)
+    try:
+        todo = dict(pending(conn))
+        if list_only:
+            for cid, text in todo.items():
+                typer.echo(f"{cid}: {text}")
+            typer.echo(f"{len(todo)} pending")
+            return
+        decisions: list[tuple[int, str | None]] = [(c, to) for c in accept] + [
+            (c, None) for c in reject
+        ]
+        if not decisions and sys.stdin.isatty():
+            for cid, text in todo.items():
+                typer.echo(f"\n[{cid}] {text}")
+                choice = typer.prompt("g=generic t=target r=reject s=skip q=quit", default="s")
+                if choice == "q":
+                    break
+                if choice in ("g", "t", "r"):
+                    decisions.append((cid, {"g": "generic", "t": "target"}.get(choice)))
+        for cid, dest in decisions:
+            if cid not in todo:
+                typer.echo(f"{cid}: not pending; skipped")
+                continue
+            if dest is not None:
+                added = append_rule(files[dest], todo[cid])
+                typer.echo(f"{cid}: {'added to' if added else 'already in'} {files[dest]}")
+            decide(conn, cid, accept=dest is not None)
+    finally:
+        conn.close()
+    for name, path in files.items():
+        if line_count(path) > MAX_LINES:
+            typer.echo(
+                f"warning: {name} LEARNINGS.md has {line_count(path)} lines (cap {MAX_LINES})"
+            )

@@ -5,4 +5,5 @@
 # 4: TASK.md inlines target.s, the needed declarations and LEARNINGS (Phase 3, A1).
 # 5: similarity-ranked examples, none decompiled with or after a bench target (Phase 3, B1).
 # 6: m2c draft.c seeds candidate.c when M2C is set (Phase 3, B2).
-CONTEXT_VERSION = 6
+# 7: LEARNINGS = rematch's generic rules + the target's .rematch/LEARNINGS.md (Phase 3, B3).
+CONTEXT_VERSION = 7

@@ -161,6 +161,8 @@ def test_provisional_block_parses() -> None:
     ]
     assert extract_block("int F(void) { return 0; }") is None
     assert check_block(BLOCK.replace("unk_08 : 4", "unk_08_0 : 4"), "") is None  # bitfield suffix
+    fptr = BLOCK.replace("u16 unk_04; // comment", "void (*unk_04[3])(void);")
+    assert check_block(fptr, "") is None
     assert check_block(BLOCK, "typedef int Other;") is None
 
 

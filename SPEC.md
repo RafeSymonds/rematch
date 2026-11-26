@@ -15,6 +15,8 @@ This file is the source of truth for structure, contracts and procedures. If cod
 | **Attempt** | One worker session on one function (or one TU data task). |
 | **Match** | Candidate object code for the symbol is identical to the vanilla object (§6.5). |
 | **Bench / live** | Bench: target is a human-decompiled function with its C hidden. Live: target is a function still in assembly. |
+| **Provisional type** | A struct or union a worker declares in its candidate because ctx.h has no fitting type (§16.1). Private to that match until merged. |
+| **Shared type** | A type accepted by `type_merge` (§16.2): one definition that every match using it compiles against at 100%. Injected into ctx.h for later workers. |
 
 ---
 
@@ -82,6 +84,13 @@ overlay_anonymous = "ov{overlay:02d}_{address:08X}"
 
 Phase 1 sections are optional for validation, and the commands that need one fail with a message naming the missing table. `[build]` requires `build_dir` in every version. Formats are names of parsers implemented in rematch for toolchain and ecosystem formats (never per-game code). Adding a format means adding a parser with fixture tests. The `[context]` command runs through `TOOLCHAIN_EXEC` with cwd = the vanilla worktree, receives a stub `.c` containing `#include` lines as `{input}`, and prints a flattened context (types, prototypes and macro definitions) on stdout.
 
+### 2.1.2 Phase 4 fields
+
+```toml
+[types]
+header = "include/rematch_types.h"         # rematch-owned header for shared types, created on rematch/live only (§10, §16)
+```
+
 ### 2.2 `TARGET.md`
 
 Before Phase 1 starts, TARGET.md must state, with values taken from the vanilla build (`build.ninja`, `compile_commands.json`, the map file) and never guessed:
@@ -129,6 +138,8 @@ rematch/
     bench/pool.py  bench/sets.py  bench/report.py
     lint/readability.py
     learnings/candidates.py  learnings/curate.py
+    types/provisional.py  types/probe.py  types/merge.py  types/reference.py   # §16
+    naming/propose.py                                                          # §16.5
     selftest/oracle_agent.py  selftest/saboteur_agent.py
   prompts/
     worker_system.md             # Appendix A (versioned: header line `prompt_version: N`)
@@ -231,7 +242,8 @@ CREATE TABLE attempts (
   id             INTEGER PRIMARY KEY,
   run_id         INTEGER NOT NULL REFERENCES runs(id),
   function_id    INTEGER REFERENCES functions(id),
-  task_kind      TEXT NOT NULL CHECK (task_kind IN ('function','tu_data','tu_fix')),
+  task_kind      TEXT NOT NULL CHECK (task_kind IN ('function','tu_data','tu_fix',
+                                                     'type_merge','naming')),
   model          TEXT, effort TEXT, escalation INTEGER,
   prompt_version INTEGER, context_version INTEGER,
   started_at     TEXT, ended_at TEXT,
@@ -264,6 +276,60 @@ CREATE TABLE learning_candidates (
 CREATE TABLE bench_sets (
   id TEXT PRIMARY KEY,                       -- e.g. 'b100-s42-c20260701'
   function_ids_json TEXT NOT NULL, seed INTEGER, cutoff TEXT, created_at TEXT NOT NULL
+);
+
+-- Type recovery (§16). Tables exist from Phase 0; they fill from Phase 2 on.
+CREATE TABLE shared_types (
+  id               INTEGER PRIMARY KEY,
+  name             TEXT NOT NULL UNIQUE,     -- UnkStruct_<ADDR> until the naming pass renames it
+  kind             TEXT NOT NULL CHECK (kind IN ('struct','union')),
+  size             INTEGER,                  -- sizeof, measured by the compiler (§16.1)
+  definition       TEXT NOT NULL,            -- C definition injected into ctx.h
+  fields_json      TEXT NOT NULL,            -- [{"offset": 44, "size": 2, "type": "u16", "name": "unk_2C"}, ...]
+  origin           TEXT NOT NULL CHECK (origin IN ('merge','reference')),
+  status           TEXT NOT NULL DEFAULT 'proposed'
+                   CHECK (status IN ('proposed','accepted','rejected','superseded')),
+  merge_attempt_id INTEGER REFERENCES attempts(id),
+  verified_matches INTEGER,                  -- matches re-verified at 100% against this definition
+  header           TEXT,                     -- header it was written to on rematch/live (§10)
+  created_at       TEXT NOT NULL,
+  decided_at       TEXT
+);
+
+CREATE TABLE provisional_types (
+  id             INTEGER PRIMARY KEY,
+  function_id    INTEGER NOT NULL REFERENCES functions(id),  -- the match that declared it
+  attempt_id     INTEGER REFERENCES attempts(id),
+  name           TEXT NOT NULL,              -- UnkStruct_<ADDR>[_N]
+  kind           TEXT NOT NULL CHECK (kind IN ('struct','union')),
+  size           INTEGER,                    -- measured sizeof
+  fields_json    TEXT NOT NULL,              -- measured offsets and sizes, as in shared_types
+  signature      TEXT NOT NULL,              -- canonical "offset:size,..." string for clustering
+  source         TEXT NOT NULL,              -- the declaration as the worker wrote it
+  shared_type_id INTEGER REFERENCES shared_types(id),  -- set when merged
+  created_at     TEXT NOT NULL,
+  UNIQUE (function_id, name)
+);
+
+CREATE TABLE type_uses (                     -- which matches compile against which shared type
+  shared_type_id INTEGER NOT NULL REFERENCES shared_types(id),
+  function_id    INTEGER NOT NULL REFERENCES functions(id),
+  PRIMARY KEY (shared_type_id, function_id)
+);
+
+CREATE TABLE name_proposals (                -- naming pass (§16.5); applied only after human approval
+  id             INTEGER PRIMARY KEY,
+  subject        TEXT NOT NULL CHECK (subject IN ('function','type','field')),
+  function_id    INTEGER REFERENCES functions(id),
+  shared_type_id INTEGER REFERENCES shared_types(id),
+  field_offset   INTEGER,                    -- subject 'field' only
+  current_name   TEXT NOT NULL,
+  proposed_name  TEXT NOT NULL,
+  evidence_json  TEXT NOT NULL,              -- strings, callees, constants, reference-repo equivalents
+  attempt_id     INTEGER REFERENCES attempts(id),
+  status         TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','accepted','rejected')),
+  created_at     TEXT NOT NULL,
+  decided_at     TEXT
 );
 ```
 
@@ -317,14 +383,15 @@ For each function, produce a sandbox `ctx.h`:
 2. Headers needed = the target's base header + the headers declaring every callee and every referenced symbol (call targets, pool symbol entries).
 3. Flatten them via `make_context` (for example a target-provided m2ctx-style script run on a stub `.c` that includes those headers). Strip the target function's own prototype only if it would conflict. Keep it otherwise, because a correct prototype is legitimate info.
 4. Bench mode: the context must not contain the target's body. Headers never contain bodies, but static inline functions defined in headers are fine.
-5. Record `context_version` (bump whenever builder logic changes).
+5. Append the accepted shared types (§16.2) relevant to the function, after the flattened headers and before TU-local declarations: types used by matches in the same TU, by its callers or by its callees. Types not yet materialized in a header exist only here.
+6. Record `context_version` (bump whenever builder logic changes).
 
 ### 6.4 Compile-and-diff (`rematch cd`): the worker's only tool
 
 Invocation inside a sandbox: `./check` (no arguments). It runs `rematch cd --sandbox <dir>` and prints the text rendering (§6.6). `cd` reads only the sandbox: `task.json` records the compile argv per version, the toolchain prefix, the disassembler and the limits, so `./check` needs no `.env`. Exit codes: 0 `MATCH`, 1 no match (including compile errors and rejections), 3 `STOP`.
 
 Steps:
-1. Read `candidate.c`. Reject immediately (status `rejected`, no compile; this counts as a check) if it contains (outside comments and string literals): `asm`, `__asm`, any `#pragma`, an `#include` of anything except `"ctx.h"`, no definition of the target function, or more than one.
+1. Read `candidate.c`. Reject immediately (status `rejected`, no compile; this counts as a check) if it contains (outside comments and string literals): `asm`, `__asm`, any `#pragma`, an `#include` of anything except `"ctx.h"`, no definition of the target function, or more than one. From Phase 2, also reject a provisional-types block (§16.1) that is not at the top, appears twice, contains anything but type declarations, or redefines a name ctx.h declares.
 2. Write scratch TU `scratch.<version>.c` = `#include "<ctx>"\n#line 1 "candidate.c"\n` + candidate. If the candidate defines the target `static`, append `void *const rematch_keep_<symbol> = (void *)<symbol>;`: nothing references the function in isolation, so the compiler would not emit it. The worker never sees this line.
 3. **Isolated mode (default):** compile the scratch TU with the exact argv from the vanilla build's `compile_commands.json` entry for the TU (for an assembly TU: the first C entry with the same output directory), with only the source and output swapped, cwd = the entry's `directory`, through `TOOLCHAIN_EXEC`. Timeout `COMPILE_TIMEOUT_SEC`.
    - Context for a human-C target (bench, round-trip) = the flattened headers of the TU's `#include` lines, plus the TU's own declarations: its text without `#include` lines and without the target's definition, with `inline` bodies kept and every other body turned into a prototype. Other functions' `static` prototypes lose `static`, because mwcc rejects a call to a static function it never sees defined.
@@ -457,6 +524,7 @@ After exit: re-hash the sandbox (`invalid` if anything changed). Then re-run `re
 - 100% match but lint fail → `nonmatch` (lint failure noted). It stays retryable with the lint errors shown next time.
 - Otherwise the most specific of: `compile_fail` (never compiled), `stagnation`, `check_limit`, `turn_limit`, `timeout`, `budget`, `nonmatch`, `error`
 - Parse `NOTES.md` bullets into `learning_candidates`.
+- On `match`, record the candidate's provisional types (§16.1) in `provisional_types`, with offsets and sizes measured by the compiler.
 
 ---
 
@@ -505,6 +573,8 @@ A match is accepted only if `lint/readability.py` passes:
 - no unused locals, no self-assignments, no no-op casts chains (`(int)(u32)(int)x`)
 - identifiers: unknown struct fields as `unk_XX` (hex offset), unknown locals as descriptive or `var0..`; never invent "meaningful" names for things not evidenced (callee names, string contents, or constants are evidence)
 - clang-format clean using the target repo's `.clang-format`, if it has one
+- provisional types follow §16.1 (names, `unk_XX` fields, no redefinition of ctx.h names)
+- (Phase 4) no raw pointer math into an object that has a type: once a shared or provisional type describes the pointee, `*(T *)((u8 *)p + N)`, `((u8 *)p)[N]` and similar fail the lint. Use the field.
 
 Lint results are stored in `matches.lint_json`.
 
@@ -514,8 +584,8 @@ Lint results are stored in `matches.lint_json`.
 
 Runs only in the live worktree on branch `rematch/live`, one TU at a time, serialized behind a file lock.
 
-1. Preconditions: every function in the assembly TU is `matched`, and the TU's data sections are converted (a `tu_data` task produces C definitions for its data, rodata and bss sections, verified by the whole-object diff in step 3).
-2. Build the TU's C file: includes (union of needed headers, minimal), data definitions, then functions **in address order**.
+1. Preconditions: every function in the assembly TU is `matched`, and the TU's data sections are converted (a `tu_data` task produces C definitions for its data, rodata and bss sections, verified by the whole-object diff in step 3). Every provisional type used by the TU's matches is either merged into an accepted shared type or TU-local: used only inside this TU and reduced to one definition by a TU-scoped `type_merge` (§16.2).
+2. Build the TU's C file: includes (union of needed headers, minimal, plus the rematch types header if the TU uses shared types), TU-local type definitions, data definitions, then functions **in address order**. Accepted shared types the TU uses are written to the target's rematch-owned types header (target.toml `[types] header`, created on `rematch/live` only), never into existing headers. Moving a type into an existing header is a human decision.
 3. Compile the TU and diff **all sections** of the new object against the vanilla assembly TU's object, for every version. On mismatch, spawn a `tu_fix` attempt with the object-level diff. Typical causes: data or string ordering, `static` vs external linkage, function order.
 4. `swap_tu_to_c`: replace the assembly TU with the C TU in the target's link-order source file (never in generated files), and `git rm` the assembly file.
 5. Build **all** versions from clean, and check every hash.
@@ -534,7 +604,9 @@ Runs only in the live worktree on branch `rematch/live`, one TU at a time, seria
 
 ### 11.2 Sets
 
-`rematch bench --n N --seed S [--pool clean|contaminated]` creates or reuses a frozen set: stratified by size bucket (S: <40 insns, M: 40–150, L: >150) proportional to the pool. Set id `b<N>-s<S>-c<cutoff>`. Prompt and context changes **must** be compared on the same set id.
+`rematch bench --n N --seed S [--pool clean|contaminated] [--types stripped]` creates or reuses a frozen set: stratified by size bucket (S: <40 insns, M: 40–150, L: >150) proportional to the pool. Set id `b<N>-s<S>-c<cutoff>`. Prompt and context changes **must** be compared on the same set id.
+
+**Types-stripped variant (Phase 3, optional, §16.4):** the same set with the struct and union definitions the target dereferences replaced in ctx.h by incomplete declarations, so the worker must recover layouts as in live mode. Results carry the suffix `-ts` (for example `b100-s42-c20260701-ts`) and are reported separately.
 
 ### 11.3 Metrics (`rematch report`)
 
@@ -564,6 +636,8 @@ rematch integrate [--tu TU | --ready | --verify-branch]        # --verify-branch
 rematch report [--run ID | --last] [--compare ID]
 rematch stuck --list | --show FUNCTION
 rematch learnings review            # interactive accept/reject of candidates
+rematch types list | show NAME | merge [--cluster ID] [--tu TU]   # type recovery (§16.2)
+rematch names review                # interactive accept/reject of name proposals (§16.5)
 rematch sync-upstream
 ```
 
@@ -583,6 +657,7 @@ Every command that can spend tokens (`attempt`, `bench`, `run`) prints an estima
 - **Saboteur agent:** tries to edit `ctx.h` or `target.s` and write outside the sandbox. It must produce outcome `invalid`, and the vanilla worktree must be byte-identical afterwards.
 - CI-equivalent local command: `uv run pytest -q && uv run ruff check && uv run mypy src`.
 - Tests never invoke the real `claude` binary. `CLAUDE_BIN` is swapped for the fakes.
+- Type recovery: the offset/size probe (§16.1) against known layouts; the `type_merge` gate with a fake agent: a compatible merge is accepted and re-verifies every match at 100%; a merge that breaks one match is rejected and changes nothing.
 
 ---
 
@@ -592,6 +667,42 @@ Every command that can spend tokens (`attempt`, `bench`, `run`) prints an estima
 - The integrator is the only writer to the live worktree.
 - No network tools for workers (`--tools` excludes WebFetch and WebSearch; `--strict-mcp-config` with no config).
 - Secrets only in `.env`. Never log `ANTHROPIC_API_KEY`.
+
+---
+
+## 16. Type recovery
+
+Workers match one function at a time, but most unmatched functions use structs the target's headers don't define. Matching forces a worker to infer the layout anyway (field width decides `ldrb`/`ldrh`/`ldr`, struct size decides indexing). Without this section each worker would do it privately, as pointer math or an ad-hoc struct, and nothing would collect, reconcile or reuse the result. TU integration would then meet conflicting definitions of the same struct, and readability would suffer. The correctness gate stays mechanical: a type is accepted only if every match using it still compiles to 100%.
+
+### 16.1 Provisional types (Phase 2)
+
+- A worker that needs a type ctx.h lacks declares it in one block at the top of `candidate.c`, between `/* rematch:types */` and `/* rematch:end-types */` (prompt rule, Appendix A). The block holds only struct, union, enum and typedef declarations.
+- Names: `UnkStruct_<ADDR>` (or `UnkUnion_<ADDR>`), where `<ADDR>` is the target function's address in 8 hex digits, with `_1`, `_2` suffixes for several. Fields are `unk_XX` by hex offset. Gaps are `u8 unk_XX[N]` padding. The block may not redefine a name ctx.h declares (pre-filter, §6.4).
+- Offsets and sizes are measured, not parsed: on a match, `cd` compiles a probe that stores `sizeof` and every field's `offsetof` and size in a data object, and reads the values back from the object. The names are only a convention, and the compiler is the authority on layout.
+- On `match`, the block's types are stored in `provisional_types` with their measured layout and a canonical signature (`offset:size,...`). The block stays in `matches.c_source`.
+
+### 16.2 `type_merge` (Phase 4)
+
+A task kind that turns provisional types into shared ones.
+
+1. **Cluster** provisional types (and already accepted shared types) that are likely the same type. Hard constraints: equal size where both are known, and no conflicting (offset, size) pairs. Evidence that raises the score: many overlapping fields; the same pointer passed between functions (a match passes its typed pointer to a callee whose own match declares a type for that parameter); the same allocation size constant (`sizeof` equals the size passed to the allocator at the creation site); the same TU. `--tu TU` restricts a run to one TU, for TU-local types before integration (§10).
+2. **Propose**: an agent receives the cluster (definitions, the code that accesses each field, the evidence) and writes one definition, the union of known fields with `unk_XX` names. It may widen padding into fields but not change a field's measured offset or size.
+3. **Verify (the gate)**: for every match that uses any type in the cluster, rebuild its sandbox with the proposed definition in ctx.h, rewrite the match's source mechanically (drop the merged declarations from its block, replace the type names), and run `rematch cd` for every required version, plus lints. If any match drops below 100% or fails a lint, the merge is `rejected` and nothing changes.
+4. **Accept**: the shared type becomes `accepted`, the provisional rows link to it, `type_uses` records every verified match, and `matches.c_source` holds the rewritten source (the previous source stays in attempt history). Accepted types flow into ctx.h (§6.3 step 5).
+
+A later change to an accepted type (for example a merge with another cluster) goes through the same gate over all of its `type_uses`, and the old definition becomes `superseded`.
+
+### 16.3 Reference layouts (Phase 4)
+
+Headers of `REFERENCE_REPOS` (related decomp projects with the same engine or compiler) are indexed by layout: size plus the list of (offset, size) fields. A provisional or shared type whose layout matches exactly one reference struct (same size, every known field compatible, at least 4 fields) gets a proposal with `origin = 'reference'`. It goes through the same gate as a merge. The reference type's name is evidence for the naming pass, not applied automatically.
+
+### 16.4 Types-stripped bench (Phase 3, optional)
+
+Human-C bench targets see the target's real headers, which already contain the types humans recovered, so the plain bench never measures layout recovery. In the types-stripped variant (§11.2), the struct and union definitions the target function dereferences are replaced in ctx.h by incomplete declarations (`typedef struct X X;`). Types passed or returned by value stay complete, because the code can't compile otherwise. The worker must declare provisional types, and the match rate shows how well layouts are recovered. Reported separately, never mixed with the plain bench.
+
+### 16.5 Naming pass (Phase 5)
+
+Names don't change code bytes, but they make the source useful. A cheaper model proposes names for functions, shared types and fields from evidence: string contents, callee names, constants, and reference-repo equivalents (§16.3). Proposals go to `name_proposals` with their evidence. A human accepts or rejects them (`rematch names review`). Accepted renames are applied on `rematch/live` by the integrator, followed by the usual build of every version and hash check, because symbol renames touch every caller. Nothing is renamed automatically.
 
 ---
 
@@ -616,6 +727,17 @@ Rules:
 - Name unknown struct fields unk_XX by hex offset. Do not invent meaningful
   names without evidence (callee names, strings, constants).
 - Use ctx.h for types and prototypes; do not redefine what it declares.
+- If ctx.h has no type for a struct you access, declare one in the
+  provisional-types block at the top of candidate.c:
+    /* rematch:types */
+    typedef struct UnkStruct_<ADDR> {
+        u8 unk_00[0x2C];
+        u16 unk_2C;
+    } UnkStruct_<ADDR>;
+    /* rematch:end-types */
+  <ADDR> is your function's address; add _1, _2 for more types. Fields are
+  unk_XX by hex offset, gaps are u8 arrays. Prefer fields over pointer math
+  like *(u16 *)((u8 *)p + 0x2C).
 - Read examples/ first: they are similar functions that already match. Copy
   their idioms.
 - Read LEARNINGS.md: compiler quirks discovered so far.

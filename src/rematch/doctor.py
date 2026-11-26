@@ -214,6 +214,35 @@ def check_toolchain_exec(runner: ToolchainRunner, cwd: Path) -> CheckResult:
     return CheckResult(name, True, " ".join(runner.prefix))
 
 
+def check_workdir_visible(runner: ToolchainRunner, workdir: Path) -> CheckResult:
+    """Sandboxes are compiled through TOOLCHAIN_EXEC, so the toolchain must see REMATCH_WORKDIR."""
+    name = "toolchain sees workdir"
+    workdir = workdir.expanduser()
+    try:
+        workdir.mkdir(parents=True, exist_ok=True)
+        result = runner.run(["test", "-d", str(workdir)], cwd=workdir, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return CheckResult(name, False, f"{workdir}: {exc}")
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit {result.returncode}"
+        return CheckResult(name, False, f"{workdir} not visible to the toolchain: {detail}")
+    return CheckResult(name, True, str(workdir))
+
+
+def check_tool(name: str, argv: list[str], must_contain: str | None = None) -> CheckResult:
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return CheckResult(name, False, f"cannot run {argv[0]}: {exc}")
+    first = (result.stdout or result.stderr).strip().splitlines()[:1]
+    version = first[0] if first else ""
+    if result.returncode != 0:
+        return CheckResult(name, False, f"{argv[0]} exited {result.returncode}")
+    if must_contain is not None and must_contain not in result.stdout:
+        return CheckResult(name, False, f"{argv[0]} is not {must_contain}: {version!r}")
+    return CheckResult(name, True, version)
+
+
 def sha1_file(path: Path) -> str:
     digest = hashlib.sha1()
     with path.open("rb") as handle:
@@ -292,8 +321,11 @@ def iter_doctor(settings: Settings, log: Log = lambda _msg: None) -> Iterator[Ch
         toolchain = check_toolchain_exec(runner, worktree)
         yield toolchain
         if toolchain.ok:
+            yield check_workdir_visible(runner, settings.rematch_workdir)
             for version in target.versions():
                 yield check_version(target, worktree, version, log)
             yield check_required_paths(worktree, definition.required_paths)
 
+    yield check_tool("objdump", [settings.objdump, "--version"])
+    yield check_tool("ctags", [settings.ctags, "--version"], must_contain="Universal Ctags")
     yield check_db(settings.db_path(definition.name))

@@ -98,3 +98,74 @@ def test_build_failure_reports_output(tmp_path: Path) -> None:
     target = TomlTarget(load_target_def(repo), ToolchainRunner(), 10)
     with pytest.raises(BuildError, match=r"exited 3(.|\n)*boom"):
         target.build(repo, "us")
+
+
+PHASE1 = f"""
+name = "demo"
+default_versions = ["us"]
+
+[versions.us]
+build = ["make"]
+rom = "out/us.bin"
+sha1 = "{SHA}"
+build_dir = "build/us"
+
+[build]
+map = "main.map"
+map_format = "mwld-xmap"
+
+[source]
+asm = ["asm/**/*.s"]
+c = ["src/**/*.c"]
+exclude = ["lib/**"]
+include_dirs = ["include"]
+version_defines = ["US"]
+
+[link_order]
+file = "link.lsf"
+format = "nitro-lsf"
+
+[asm]
+format = "pret-macros"
+
+[context]
+command = ["sh", "{{target_dir}}/ctx.sh", "{{version}}", "{{input}}"]
+
+[naming]
+anonymous = "sub_{{address:08X}}"
+overlay_anonymous = "ov{{overlay:02d}}_{{address:08X}}"
+"""
+
+
+def test_phase1_sections(tmp_path: Path) -> None:
+    definition = load_target_def(write_toml(tmp_path, PHASE1))
+    build = definition.require(definition.build_info, "build")
+    assert build.compile_commands == "compile_commands.json"
+    assert definition.build_dir(Path("/w"), "us") == Path("/w/build/us")
+    assert definition.require(definition.link_order, "link_order").format == "nitro-lsf"
+    assert definition.naming.overlay_anonymous.format(overlay=1, address=0x02100010) == (
+        "ov01_02100010"
+    )
+
+
+def test_phase0_target_lacks_phase1_sections(tmp_path: Path) -> None:
+    definition = load_target_def(write_toml(tmp_path, TARGET_TOML))
+    with pytest.raises(TargetDefError, match=r"no \[link_order\] section"):
+        definition.require(definition.link_order, "link_order")
+    with pytest.raises(TargetDefError, match="build_dir"):
+        definition.build_dir(Path("/w"), "alpha")
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "message"),
+    [
+        ('build_dir = "build/us"\n', "", "requires build_dir"),
+        ('format = "nitro-lsf"', 'format = "gnu-ld"', "nitro-lsf"),
+        ('map = "main.map"', 'map = "../main.map"', "relative"),
+        ("command = [", "command = []\nx = [", "command"),
+    ],
+)
+def test_phase1_invalid(tmp_path: Path, old: str, new: str, message: str) -> None:
+    assert old in PHASE1
+    with pytest.raises(TargetDefError, match=message):
+        load_target_def(write_toml(tmp_path, PHASE1.replace(old, new, 1)))

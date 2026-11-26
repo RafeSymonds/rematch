@@ -26,6 +26,8 @@ _SETTINGS_ENV = (
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
     monkeypatch.setenv("CLAUDE_BIN", str(FAKE_CLAUDE))
+    monkeypatch.setenv("OBJDUMP", str(FAKES / "objdump"))
+    monkeypatch.setenv("CTAGS", str(FAKES / "ctags"))
     for key in _SETTINGS_ENV:
         monkeypatch.delenv(key, raising=False)
     # A real .env in the repo root must never leak into tests.

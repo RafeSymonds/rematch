@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "GNU objdump (fake) 2.45"

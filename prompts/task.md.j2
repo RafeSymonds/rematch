@@ -21,7 +21,7 @@ needs, and LEARNINGS.md. You don't need to open those files.
 - examples/: {{ examples|length }} similar functions with matching C{% if examples %} ({{ examples|join(", ") }}){% endif %}
 
 {% if draft %}
-- draft.c: an automatic first draft (often wrong in details)
+- draft.c: an automatic first draft from m2c (often wrong in details). candidate.c starts as a copy of it.
 {% endif %}
 {% if previous_best %}
 - previous_best.c / previous_best.diff: best earlier attempt ({{ previous_best_score }}%)

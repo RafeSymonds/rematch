@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     diff_backend: Literal["objdiff", "objdump"] = "objdump"
     objdiff_bin: str = "objdiff-cli"
     objdump: str = "objdump"
+    m2c: str = ""  # path to m2c.py for draft.c seeding (Phase 3 B2); empty = no drafts
     ctags: str = "ctags"
     bench_cutoff_date: str = "2026-07-01"
     compile_timeout_sec: float = Field(default=20, gt=0)

@@ -15,6 +15,7 @@ from pathlib import Path
 from rematch import prompts
 from rematch.context.declarations import declarations, read_tags
 from rematch.context.header_index import HeaderIndex
+from rematch.context.m2c import m2c_asm, run_m2c
 from rematch.diff.match import function_view
 from rematch.diff.objdump_backend import Line, disassemble, run_objdump
 from rematch.inventory import asm_parser, link_order
@@ -294,11 +295,22 @@ def build_sandbox(
     )
     target_s = render_target(shown, primary_lines, tu_text, asm_format)
     (out / "target.s").write_text(target_s)
+    draft = None
+    if s.settings.m2c and not opts.with_source:
+        draft = run_m2c(Path(s.settings.m2c), m2c_asm(symbol, primary_lines), None)
+        if draft is not None:
+            draft = f"// Automatic first draft (m2c); often wrong in details.\n{draft}"
+            (out / "draft.c").write_text(draft, encoding="utf-8")
     if opts.with_source:
         source = function_source(tu_text, fn.name)
         if source is None:
             raise SandboxError(f"no C source for {fn.name} in {fn.tu_path}")
         candidate = _rename(source, fn.name, symbol) + "\n"
+    elif draft is not None and (body := function_source(draft, symbol)) is not None:
+        # m2c's preamble guesses externs with `?` types; seed only the function itself.
+        candidate = (
+            f"// Starting point: m2c's draft (see draft.c). Fix it until ./check matches.\n{body}\n"
+        )
     else:
         candidate = f"// Write {symbol} here. Its prototype, if known, is in ctx.h.\n"
     (out / "candidate.c").write_text(candidate, encoding="utf-8")
@@ -322,7 +334,7 @@ def build_sandbox(
                 n_insns=sum(1 for ln in primary_lines if not ln.is_data),
                 module=fn.module,
                 examples=example_names,
-                draft=None,
+                draft=draft is not None,
                 previous_best=None,
                 previous_best_score=None,
                 max_checks=s.settings.max_checks,

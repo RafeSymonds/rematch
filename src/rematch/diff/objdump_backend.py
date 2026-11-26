@@ -13,7 +13,7 @@ from __future__ import annotations
 import hashlib
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from rematch.toolchain.objects import ObjectFile, Reloc, Symbol
@@ -34,6 +34,7 @@ class Line:
     operands: str  # normalized
     is_data: bool = False
     reloc: str | None = None  # normalized relocation target at this line, if any
+    label: str | None = None  # `.L<k>` if a local branch targets this line (not part of `text`)
 
     @property
     def text(self) -> str:
@@ -257,4 +258,4 @@ def _normalize(
             lines.append(Line(off, mn, f"{dest}, ={pool_value}", reloc=reloc))
             continue
         lines.append(Line(off, mn, clean, reloc=reloc))
-    return lines
+    return [replace(ln, label=labels[ln.offset]) if ln.offset in labels else ln for ln in lines]

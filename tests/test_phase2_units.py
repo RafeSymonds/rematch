@@ -247,7 +247,6 @@ def test_worker_argv_isolation_flags(tmp_path: Path) -> None:
         "--strict-mcp-config",
         "--disable-slash-commands",
         "--max-turns 7",
-        "--no-session-persistence",
         "--output-format stream-json",
         "Bash(./check)",
         deny_rule(tmp_path / "secret"),
@@ -255,6 +254,9 @@ def test_worker_argv_isolation_flags(tmp_path: Path) -> None:
         assert flag in joined
     assert "--bare" not in argv and "Bash" not in argv[argv.index("--allowedTools") + 1 :][:1]
     assert deny_rule(Path("/a/b")) == "Read(//a/b/**)"
+    assert "--no-session-persistence" not in argv  # sessions persist so rate limits can resume
+    resumed = worker_argv(_cfg(tmp_path, Path("claude")), "P", resume="sess-1")
+    assert resumed[resumed.index("--resume") + 1] == "sess-1"
     api = worker_argv(_cfg(tmp_path, Path("claude"), auth="api"), "P")
     assert "--bare" in api and "--max-budget-usd" in api
 
@@ -378,3 +380,78 @@ def test_prompts_render() -> None:
         version_cond=True,
     )
     assert "sub_1" in task and "every target version" in task and "draft.c" not in task
+
+
+# --- rate limits and resume ------------------------------------------------------------
+
+
+def test_rate_limit_wait_classification(tmp_path: Path) -> None:
+    from rematch.worker.invoke import InvokeResult, rate_limit_wait
+
+    def res(result: dict[str, object] | None, stderr: str = "") -> InvokeResult:
+        return InvokeResult(exit_code=1, seconds=1.0, result=result, stderr_tail=stderr)
+
+    assert rate_limit_wait(res({"is_error": False, "subtype": "success"}), 0, 0) is None
+    assert (
+        rate_limit_wait(res({"is_error": True, "result": "API Error: 429 rate limit"}), 0, 0) == 60
+    )
+    assert rate_limit_wait(res({"is_error": True, "result": "Overloaded"}), 0, 3) == 480
+    assert rate_limit_wait(res({"is_error": True, "result": "Overloaded"}), 0, 9) == 900
+    usage = res({"is_error": True, "result": "Claude AI usage limit reached|1764200600"})
+    assert rate_limit_wait(usage, 1764200000, 0) == 600
+    assert rate_limit_wait(res(None, "Error: 529 overloaded"), 0, 1) == 120
+    assert rate_limit_wait(res({"is_error": True, "result": "compile crashed"}), 0, 0) is None
+
+
+def test_rate_limited_attempt_resumes_session(tmp_path: Path) -> None:
+    from rematch.worker.attempt import AttemptSpec, _run_segments
+    from rematch.worker.sandbox import FunctionRecord, SandboxOptions
+
+    calls = tmp_path / "calls.log"
+    claude = _fake_claude(
+        tmp_path,
+        (
+            f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "resumed = '--resume' in sys.argv\n"
+            "print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': 'sess-42'}))\n"
+            "if resumed:\n"
+            "    print(json.dumps({'type': 'result', 'subtype': 'success', 'num_turns': 4,"
+            " 'session_id': 'sess-42', 'total_cost_usd': 0.1}))\n"
+            "else:\n"
+            "    print(json.dumps({'type': 'result', 'subtype': 'error', 'is_error': True,"
+            " 'num_turns': 3, 'result': 'API Error: 429 rate limit', 'total_cost_usd': 0.05}))"
+        ),
+    )
+    (tmp_path / "TASK.md").write_text("# Task: match F (thumb, 1 instructions, module m)\n")
+
+    class Gate:
+        def __init__(self) -> None:
+            self.paused: list[float] = []
+
+        def pause(self, seconds: float) -> None:
+            self.paused.append(seconds)
+
+        def wait(self) -> None:
+            return None
+
+    gate = Gate()
+    fn = FunctionRecord(1, "F", 0, "m", "t.c", "c_human", "thumb", False)
+    spec = AttemptSpec(
+        run_id=1,
+        kind="bench",
+        fn=fn,
+        options=SandboxOptions(),
+        model="m",
+        effort="e",
+        system_prompt=tmp_path / "sys.md",
+        gate=gate,
+    )
+    result, totals = _run_segments(
+        _cfg(tmp_path, claude), tmp_path, tmp_path / "s.jsonl", spec, lambda _m: None
+    )
+    assert result.subtype == "success" and gate.paused == [60.0]
+    assert (totals.segments, totals.turns) == (2, 7) and totals.cost_usd == pytest.approx(0.15)
+    argvs = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert len(argvs) == 2 and "--resume" not in argvs[0]
+    assert argvs[1][argvs[1].index("--resume") + 1] == "sess-42"
+    assert (tmp_path / "s.r1.jsonl").is_file()

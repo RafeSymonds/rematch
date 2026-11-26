@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Protocol
 
 from rematch import prompts
 from rematch.context import CONTEXT_VERSION
@@ -16,7 +18,7 @@ from rematch.db import store
 from rematch.session import Session
 from rematch.types.probe import measure, signature
 from rematch.types.provisional import TypesError, extract_block, parse_block
-from rematch.worker.invoke import InvokeConfig, run_worker
+from rematch.worker.invoke import InvokeConfig, InvokeResult, rate_limit_wait, run_worker
 from rematch.worker.outcome import Classified, classify, note_bullets
 from rematch.worker.sandbox import FunctionRecord, SandboxOptions, build_sandbox, seal
 
@@ -94,6 +96,82 @@ def deny_roots(s: Session) -> tuple[Path, ...]:
     return tuple(dict.fromkeys(roots))
 
 
+MAX_RESUMES = 5
+CONTINUE_PROMPT = (
+    "Your previous session was interrupted by a rate limit. Continue the task. candidate.c, "
+    "NOTES.md and .history/ are as you left them, and ./check keeps its count."
+)
+
+
+class Gate(Protocol):
+    def pause(self, seconds: float) -> None: ...
+    def wait(self) -> None: ...
+
+
+class _NoGate:
+    def pause(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+    def wait(self) -> None:
+        return None
+
+
+@dataclass
+class Totals:
+    segments: int = 0
+    turns: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cost_usd: float = 0.0
+    seconds: float = 0.0
+
+    def add(self, r: InvokeResult) -> None:
+        self.segments += 1
+        self.turns += r.num_turns or 0
+        self.input_tokens += r.usage("input_tokens")
+        self.output_tokens += r.usage("output_tokens")
+        self.cache_read_tokens += r.usage("cache_read_input_tokens")
+        self.cost_usd += r.cost_usd or 0.0
+        self.seconds += r.seconds
+
+
+def _run_segments(
+    cfg: InvokeConfig, sandbox: Path, stream: Path, spec: AttemptSpec, log: Log
+) -> tuple[InvokeResult, Totals]:
+    """Run the worker; after a rate limit, wait (shared gate) and resume the same session.
+
+    Turn and wall-time budgets carry over across segments. If the session can't be resumed,
+    a fresh session continues in the same sandbox, where candidate.c and .history/ survive.
+    """
+    gate = spec.gate or _NoGate()
+    totals = Totals()
+    prompt = (sandbox / "TASK.md").read_text(encoding="utf-8")
+    session: str | None = None
+    for segment in range(MAX_RESUMES + 1):
+        seg_cfg = replace(
+            cfg,
+            max_turns=max(1, cfg.max_turns - totals.turns),
+            timeout_sec=max(60.0, cfg.timeout_sec - totals.seconds),
+        )
+        path = stream if segment == 0 else stream.with_suffix(f".r{segment}.jsonl")
+        result = run_worker(seg_cfg, sandbox, prompt, path, resume=session)
+        if session and result.result is None and "No conversation found" in result.stderr_tail:
+            log(f"{spec.fn.name}: session {session[:8]} not resumable; continuing fresh")
+            prompt = CONTINUE_PROMPT + "\n\n" + (sandbox / "TASK.md").read_text(encoding="utf-8")
+            result = run_worker(seg_cfg, sandbox, prompt, path.with_suffix(".fresh.jsonl"))
+        totals.add(result)
+        wait = rate_limit_wait(result, time.time(), segment)
+        if wait is None or segment == MAX_RESUMES:
+            return result, totals
+        log(f"{spec.fn.name}: rate limited; resuming in {wait:.0f}s (pausing new attempts)")
+        gate.pause(wait)
+        gate.wait()
+        session = result.session_id or session
+        prompt = CONTINUE_PROMPT
+    raise AssertionError("unreachable")
+
+
 @dataclass(frozen=True)
 class AttemptSpec:
     run_id: int
@@ -104,6 +182,7 @@ class AttemptSpec:
     effort: str
     system_prompt: Path
     claude_bin: str | None = None  # override (selftest fakes)
+    gate: Gate | None = None  # shared pause after rate limits (bench/run)
 
 
 def _record_types(
@@ -187,8 +266,7 @@ def run_attempt(s: Session, spec: AttemptSpec, log: Log) -> tuple[int, Classifie
             api_key=s.settings.anthropic_api_key.get_secret_value(),
         )
         stream = s.settings.rematch_var / "logs" / str(spec.run_id) / f"{attempt_id}.jsonl"
-        prompt = (sandbox / "TASK.md").read_text(encoding="utf-8")
-        result = run_worker(cfg, sandbox, prompt, stream)
+        result, totals = _run_segments(cfg, sandbox, stream, spec, log)
         c = classify(sandbox, manifest, result, task, control)
 
         best_path = None
@@ -206,11 +284,11 @@ def run_attempt(s: Session, spec: AttemptSpec, log: Log) -> tuple[int, Classifie
                     c.checks_used,
                     c.best_score,
                     c.final_score,
-                    result.num_turns,
-                    result.usage("input_tokens"),
-                    result.usage("output_tokens"),
-                    result.usage("cache_read_input_tokens"),
-                    result.cost_usd,
+                    totals.turns,
+                    totals.input_tokens,
+                    totals.output_tokens,
+                    totals.cache_read_tokens,
+                    totals.cost_usd,
                     str(sandbox),
                     str(stream),
                     best_path,
@@ -249,7 +327,9 @@ def run_attempt(s: Session, spec: AttemptSpec, log: Log) -> tuple[int, Classifie
                 log(f"attempt {attempt_id}: stored {n} provisional type(s)")
         log(
             f"attempt {attempt_id} {spec.fn.name}: {c.outcome} (best {c.best_score}, "
-            f"{c.checks_used} checks, {result.num_turns} turns, {result.seconds:.0f}s)"
+            f"{c.checks_used} checks, {totals.turns} turns, {totals.seconds:.0f}s"
+            + (f", resumed {totals.segments - 1}x" if totals.segments > 1 else "")
+            + ")"
         )
         return attempt_id, c
     finally:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -58,6 +59,7 @@ class InvokeResult:
     events: int = 0
     stream_path: Path | None = None
     stderr_tail: str = ""
+    session_id: str | None = None
 
     @property
     def subtype(self) -> str | None:
@@ -83,11 +85,14 @@ def deny_rule(path: Path) -> str:
     return f"Read(//{str(path.resolve()).lstrip('/')}/**)"
 
 
-def worker_argv(cfg: InvokeConfig, prompt: str) -> list[str]:
+def worker_argv(cfg: InvokeConfig, prompt: str, resume: str | None = None) -> list[str]:
+    """Sessions are persisted (no --no-session-persistence) so a rate-limited attempt can be
+    resumed with its context (`--resume`)."""
     argv = [
         cfg.claude_bin,
         "-p",
         prompt,
+        *(["--resume", resume] if resume else []),
         "--model",
         cfg.model,
         "--effort",
@@ -110,7 +115,6 @@ def worker_argv(cfg: InvokeConfig, prompt: str) -> list[str]:
         "--disable-slash-commands",
         "--max-turns",
         str(cfg.max_turns),
-        "--no-session-persistence",
         "--output-format",
         "stream-json",
         "--verbose",
@@ -137,16 +141,19 @@ class _Watch:
     lines: list[str] = field(default_factory=list)
 
 
-def run_worker(cfg: InvokeConfig, sandbox: Path, prompt: str, stream_path: Path) -> InvokeResult:
+def run_worker(
+    cfg: InvokeConfig, sandbox: Path, prompt: str, stream_path: Path, resume: str | None = None
+) -> InvokeResult:
     """Run the worker to completion or timeout; stream events to `stream_path`."""
     stream_path.parent.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
     result: dict[str, object] | None = None
+    session: str | None = None
     events = 0
     stderr_path = stream_path.with_suffix(".stderr")
     with stream_path.open("w", encoding="utf-8") as out, stderr_path.open("w") as err:
         proc = subprocess.Popen(
-            worker_argv(cfg, prompt),
+            worker_argv(cfg, prompt, resume),
             cwd=sandbox,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -177,6 +184,12 @@ def run_worker(cfg: InvokeConfig, sandbox: Path, prompt: str, stream_path: Path)
         for line in proc.stdout:
             out.write(line)
             events += 1
+            if session is None and '"session_id"' in line:
+                try:
+                    sid = json.loads(line).get("session_id")
+                except json.JSONDecodeError:
+                    sid = None
+                session = sid if isinstance(sid, str) else None
             if '"type":"result"' in line.replace(" ", ""):
                 try:
                     event = json.loads(line)
@@ -195,4 +208,28 @@ def run_worker(cfg: InvokeConfig, sandbox: Path, prompt: str, stream_path: Path)
         events=events,
         stream_path=stream_path,
         stderr_tail=tail,
+        session_id=session,
     )
+
+
+_LIMIT = re.compile(r"usage limit|rate.?limit|\b429\b|overloaded|\b529\b", re.IGNORECASE)
+_RESET = re.compile(r"limit reached\|(\d{9,11})")
+
+
+def rate_limit_wait(r: InvokeResult, now: float, attempt: int) -> float | None:
+    """Seconds to wait if the run was cut short by a rate or usage limit, else None.
+
+    Usage limits that state a reset time ("...limit reached|<epoch>") wait until then (at most
+    6 h). Other limits back off exponentially: 60 s, 120 s, ... capped at 15 min.
+    """
+    text = ""
+    if r.result is not None and r.result.get("is_error"):
+        text = str(r.result.get("result", "")) + " " + str(r.result.get("subtype", ""))
+    elif r.result is None:
+        text = r.stderr_tail
+    if not text or not _LIMIT.search(text):
+        return None
+    reset = _RESET.search(text)
+    if reset:
+        return float(min(max(int(reset.group(1)) - now, 60), 6 * 3600))
+    return float(min(60 * 2**attempt, 900))

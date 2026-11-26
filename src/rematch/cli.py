@@ -293,7 +293,7 @@ def bench(
     yes: bool = typer.Option(False, "--yes", help="Confirm token spend."),
 ) -> None:
     """Run a frozen bench set with real workers (spends tokens)."""
-    from rematch.bench.pool import Prescreen, pool_sizes
+    from rematch.bench.pool import Prescreen, PrescreenError, pool_sizes
     from rematch.bench.report import append_row, benchmarks_row, format_report, run_metrics
     from rematch.bench.run import run_functions
     from rematch.bench.sets import bucket, load_set, save_set, set_id, stratified_sample
@@ -319,7 +319,14 @@ def bench(
                 sizes = {k: v for k, v in sizes.items() if bucket(v) == size_bucket}
             typer.echo(f"pool {pool}: {len(sizes)} functions; building set {sid}")
             prescreen = Prescreen(s, conn, _echo_err, s.settings.worker_count)
-            ids, rejected = stratified_sample(sizes, n, seed, prescreen.eligible)
+            try:
+                ids, rejected = stratified_sample(sizes, n, seed, prescreen.eligible)
+            except PrescreenError as exc:
+                typer.echo(f"FAIL {exc}; set not saved")
+                raise typer.Exit(1) from exc
+            if len(ids) < min(n, len(sizes)) // 2:
+                typer.echo(f"FAIL only {len(ids)} eligible functions; set not saved")
+                raise typer.Exit(1)
             save_set(conn, sid, ids, seed, cutoff)
             typer.echo(f"set {sid}: {len(ids)} functions ({len(rejected)} failed the pre-screen)")
         fns = []

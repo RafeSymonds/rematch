@@ -82,7 +82,7 @@ anonymous = "sub_{address:08X}"            # str.format; fields: address, overla
 overlay_anonymous = "ov{overlay:02d}_{address:08X}"
 ```
 
-Phase 1 sections are optional for validation, and the commands that need one fail with a message naming the missing table. `[build]` requires `build_dir` in every version. Formats are names of parsers implemented in rematch for toolchain and ecosystem formats (never per-game code). Adding a format means adding a parser with fixture tests. The `[context]` command runs through `TOOLCHAIN_EXEC` with cwd = the vanilla worktree, receives a stub `.c` containing `#include` lines as `{input}`, and prints a flattened context (types, prototypes and macro definitions) on stdout.
+Phase 1 sections are optional for validation, and the commands that need one fail with a message naming the missing table. `[build]` requires `build_dir` in every version. Formats are names of parsers implemented in rematch for toolchain and ecosystem formats (never per-game code). Adding a format means adding a parser with fixture tests. The `[context]` command runs through `TOOLCHAIN_EXEC` with cwd = the vanilla worktree, receives a stub `.c` containing `#include` lines as `{input}`, and prints a flattened context (types, prototypes and macro definitions) on stdout. An argument that is exactly `{includes}` expands to the TU's own `-I` flags from `compile_commands.json` (absolute), so the preprocessor sees the compiler's include path. A failing context command makes the function ineligible for a bench (`context_error`), not a harness error.
 
 ### 2.1.2 Phase 2 fields
 

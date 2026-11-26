@@ -20,7 +20,7 @@ from rematch.inventory import asm_parser, link_order
 from rematch.inventory.c_parser import function_source, strip_comments, tu_local_context
 from rematch.session import Session
 from rematch.target.definition import target_dir
-from rematch.toolchain.compile_db import CompileDB
+from rematch.toolchain.compile_db import CompileDB, CompileEntry
 from rematch.toolchain.objects import ObjectFile, read_object
 from rematch.worker.check_entry import save_target
 from rematch.worker.task import CompileSpec, Task, VersionTask
@@ -30,6 +30,10 @@ LEARNINGS = Path(__file__).resolve().parents[3] / "docs" / "LEARNINGS.md"
 
 class SandboxError(Exception):
     pass
+
+
+class ContextError(SandboxError):
+    """The target's context command failed for this function's headers."""
 
 
 @dataclass(frozen=True)
@@ -95,15 +99,35 @@ def context_stub(
     return "".join(f'#include "{h}"\n' for h in headers)
 
 
-def make_context(s: Session, version: str, stub: Path) -> str:
+def include_flags(entry: CompileEntry) -> list[str]:
+    """The compile entry's `-I` directories, absolute (they are relative to its build dir)."""
+    out: list[str] = []
+    argv = list(entry.argv)
+    for i, arg in enumerate(argv):
+        path = None
+        if arg == "-I" and i + 1 < len(argv):
+            path = argv[i + 1]
+        elif arg.startswith("-I") and len(arg) > 2:
+            path = arg[2:]
+        if path is not None:
+            out.append(f"-I{(entry.directory / path).resolve()}")
+    return out
+
+
+def make_context(s: Session, version: str, stub: Path, entry: CompileEntry) -> str:
+    """Run the target's context command. `{includes}` expands to the TU's own -I flags."""
     ctx = s.definition.require(s.definition.context, "context")
-    argv = [
-        a.format(target_dir=target_dir(s.settings.target_repo), version=version, input=stub)
-        for a in ctx.command
-    ]
+    argv: list[str] = []
+    for a in ctx.command:
+        if a == "{includes}":
+            argv += include_flags(entry)
+        else:
+            argv.append(
+                a.format(target_dir=target_dir(s.settings.target_repo), version=version, input=stub)
+            )
     result = s.runner.run(argv, cwd=s.worktree, timeout=120)
     if result.returncode != 0:
-        raise SandboxError(f"context command failed: {result.stderr.strip()[:500]}")
+        raise ContextError(f"context command failed: {result.stderr.strip()[:500]}")
     return result.stdout
 
 
@@ -197,10 +221,10 @@ def build_sandbox(
     to `out/.control`.
     """
     opts = options or SandboxOptions()
-    control = (control or out / ".control").resolve()
-    control.mkdir(parents=True, exist_ok=True)
     if out.exists() and any(out.iterdir()):
         raise SandboxError(f"{out} exists and is not empty")
+    control = (control or out / ".control").resolve()
+    control.mkdir(parents=True, exist_ok=True)
     if opts.bench and fn.source_kind != "c_human":
         raise SandboxError("bench mode needs a human-C target")
     out.mkdir(parents=True, exist_ok=True)
@@ -229,7 +253,7 @@ def build_sandbox(
         callees = [ln.reloc for ln in lines if ln.reloc and not ln.reloc.startswith("<")]
         stub = out / f".ctx_stub.{version}.c"
         stub.write_text(context_stub(s, fn, tu_text, callees, index), encoding="utf-8")
-        ctx = make_context(s, version, stub)
+        ctx = make_context(s, version, stub, entry)
         stub.unlink()
         if fn.source_kind == "c_human":
             local = tu_local_context(tu_text, fn.name)

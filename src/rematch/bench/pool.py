@@ -12,12 +12,16 @@ import shutil
 import sqlite3
 from collections.abc import Callable
 
+from rematch.context import CONTEXT_VERSION
 from rematch.session import Session
 from rematch.worker.roundtrip import roundtrip
 from rematch.worker.sandbox import find_function
 
-CONTEXT_VERSION = 2
 Log = Callable[[str], None]
+
+
+class PrescreenError(Exception):
+    pass
 
 
 def pool_sizes(conn: sqlite3.Connection, pool: str, cutoff: str) -> dict[int, int]:
@@ -39,7 +43,7 @@ class Prescreen:
     def __init__(self, s: Session, conn: sqlite3.Connection, log: Log, workers: int) -> None:
         self.s, self.conn, self.log, self.workers = s, conn, log, workers
         self.path = s.settings.rematch_var / f"{s.definition.name}.prescreen.json"
-        self.key = f"{s.settings.target_pin}:{CONTEXT_VERSION}"
+        self.key = f"{s.settings.target_pin}:{CONTEXT_VERSION}"  # rebuilt when either changes
         data = json.loads(self.path.read_text()) if self.path.is_file() else {}
         self.results: dict[str, str] = data.get(self.key, {})
         self.root = s.settings.rematch_workdir.expanduser() / "prescreen"
@@ -59,6 +63,10 @@ class Prescreen:
             batch = self.root / f"batch_{fns[0].id}"
             outcomes = roundtrip(self.s, fns, batch, self.log, self.workers)
             for fn, out in zip(fns, outcomes, strict=True):
+                if out.status == "error":  # a harness problem, not a property of the function
+                    raise PrescreenError(f"pre-screen of {fn.name} failed: {out.detail[:2]}")
+                if out.status == "context_error":
+                    self.log(f"{fn.name}: context command failed; ineligible ({out.detail[:1]})")
                 self.results[str(fn.id)] = out.status
             self._save()
             shutil.rmtree(batch, ignore_errors=True)  # sandboxes hold the human C; don't keep them

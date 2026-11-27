@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -18,7 +19,9 @@ from rematch.selftest.fake_common import emit, init_event, log_invocation, resul
 def main() -> int:
     init_event("oracle")
     sandbox = Path.cwd()
-    symbol = json.loads((sandbox / "task.json").read_text())["symbol"]
+    # The worker-visible TASK.md names the symbol; task.json lives outside the sandbox.
+    first = (sandbox / "TASK.md").read_text().splitlines()[0]
+    symbol = re.match(r"# Task: match (\S+) ", first).group(1)  # type: ignore[union-attr]
     answers = json.loads(Path(os.environ["REMATCH_ORACLE_ANSWERS"]).read_text())
     source = answers[symbol]
     if os.environ.get("REMATCH_ORACLE_TYPES_FOR") == symbol:

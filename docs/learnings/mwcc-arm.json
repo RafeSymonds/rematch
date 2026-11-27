@@ -1,0 +1,421 @@
+{
+  "title": "Compiler quirks: mwcc-arm",
+  "rules": [
+    {
+      "id": "C1",
+      "text": "In a sparse switch, an explicit case sharing the default body (`case 100: default:`) still emits its own compare (`cmp r0, #100`) before the branch to that body, while a bare `default:` does not.",
+      "evidence": {
+        "a": "#include \"types.h\"\nvoid g(int);\nvoid f(int x);\nvoid f(int x) {\n    switch (x) {\n    case 1:\n        g(11);\n        break;\n    case 20:\n        g(12);\n        break;\n    case 100:\n    default:\n        g(13);\n        break;\n    }\n}\n",
+        "b": "#include \"types.h\"\nvoid g(int);\nvoid f(int x);\nvoid f(int x) {\n    switch (x) {\n    case 1:\n        g(11);\n        break;\n    case 20:\n        g(12);\n        break;\n    default:\n        g(13);\n        break;\n    }\n}\n",
+        "expect": "cmp\\s+r0, #100"
+      },
+      "sources": [
+        127
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C2",
+      "text": "A value computed from locals (`int n = (a + b) / 32; h(); k(n);`) can have its computation delayed past an intervening call, while writing the calls inside the expression (`int n = (g() + g()) / 32;`) finishes computing it right after them.",
+      "evidence": {
+        "a": "#include \"types.h\"\nint g(void);\nvoid h(void);\nvoid k(int);\nvoid f(void);\nvoid f(void) {\n    int a = g();\n    int b = g();\n    int n = (a + b) / 32;\n    h();\n    k(n);\n}\n",
+        "b": "#include \"types.h\"\nint g(void);\nvoid h(void);\nvoid k(int);\nvoid f(void);\nvoid f(void) {\n    int n = (g() + g()) / 32;\n    h();\n    k(n);\n}\n",
+        "expect": "asrs\\s+r4, r0, #5"
+      },
+      "sources": [
+        128
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C3",
+      "text": "A literal-pool operand shown as `<str:\"\">` that is loaded and then dereferenced can be a file-local variable: `static T *p;` produces it, while `extern T *p;` shows the symbol name.",
+      "evidence": {
+        "a": "#include \"types.h\"\ntypedef struct { int x; } Foo;\nstatic Foo *sFoo;\nvoid Set(Foo *p);\nvoid Set(Foo *p) { sFoo = p; }\nint Get(void);\nint Get(void) { return sFoo->x; }\n",
+        "b": "#include \"types.h\"\ntypedef struct { int x; } Foo;\nextern Foo *sFoo;\nvoid Set(Foo *p);\nvoid Set(Foo *p) { sFoo = p; }\nint Get(void);\nint Get(void) { return sFoo->x; }\n",
+        "expect": "<str:\"\">"
+      },
+      "sources": [
+        1
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C4",
+      "text": "`S l = *(const S *)&sym;` (S wraps an array) copies like a local array initializer `int l[6] = {...};`, but the literal pool names `sym` instead of anonymous data.",
+      "evidence": {
+        "a": "#include \"types.h\"\ntypedef struct { int a[6]; } S;\nextern const S data_x;\nvoid u(int *p);\nvoid f(void);\nvoid f(void) { S l = *(const S *)&data_x; u(l.a); }\n",
+        "b": "#include \"types.h\"\nvoid u(int *p);\nvoid f(void);\nvoid f(void) { int l[6] = { 1, 2, 3, 4, 5, 6 }; u(l); }\n",
+        "expect": "=data_x"
+      },
+      "sources": [
+        5
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C5",
+      "text": "`if (a() || b() || !c()) return 0;` shares one return block (`bne` to it), while separate `if (a()) return 0;` statements each emit their own return.",
+      "evidence": {
+        "a": "#include \"types.h\"\nint a(void); int b(void); int c(void); void d(void);\nint f(void);\nint f(void) { if (a() || b() || !c()) return 0; d(); return 1; }\n",
+        "b": "#include \"types.h\"\nint a(void); int b(void); int c(void); void d(void);\nint f(void);\nint f(void) { if (a()) return 0; if (b()) return 0; if (!c()) return 0; d(); return 1; }\n",
+        "expect": "beq"
+      },
+      "sources": [
+        10
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C6",
+      "text": "Passing an `int` local to a `u8` parameter truncates at the call (`lsls #24; lsrs #24`), while a `u8` local (`u8 x = h();`) is truncated at assignment and passed with a plain move.",
+      "evidence": {
+        "a": "#include \"types.h\"\nvoid g(u8 a); int h(void);\nvoid f(void);\nvoid f(void) { int x = h(); h(); g(x); }\n",
+        "b": "#include \"types.h\"\nvoid g(u8 a); int h(void);\nvoid f(void);\nvoid f(void) { u8 x = h(); h(); g(x); }\n",
+        "expect": "lsls\\s+r0, r4, #24"
+      },
+      "sources": [
+        13
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C7",
+      "text": "An unreferenced `static` function is not emitted; any reference, such as `return (void *)f;` or a non-static `void (*ref)(int *) = f;`, makes the compiler emit it.",
+      "evidence": {
+        "a": "#include \"types.h\"\nstatic void f(int *p) { *p = 1; }\nvoid *Ref(void);\nvoid *Ref(void) { return NULL; }\n",
+        "b": "#include \"types.h\"\nstatic void f(int *p) { *p = 1; }\nvoid *Ref(void);\nvoid *Ref(void) { return (void *)f; }\n",
+        "expect": "\\.word\\s+f"
+      },
+      "sources": [
+        15
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C8",
+      "text": "`V v = {0, 0, 0};` stores through a base register (`add r0, sp, #N; str r1, [r0, #4]`), while `v.x = 0; v.y = 0; v.z = 0;` stores sp-relative.",
+      "evidence": {
+        "a": "#include \"types.h\"\ntypedef struct { fx32 x, y, z; } V;\nvoid u(V *v);\nvoid f(void);\nvoid f(void) { V v = { 0, 0, 0 }; u(&v); }\n",
+        "b": "#include \"types.h\"\ntypedef struct { fx32 x, y, z; } V;\nvoid u(V *v);\nvoid f(void);\nvoid f(void) { V v; v.x = 0; v.y = 0; v.z = 0; u(&v); }\n",
+        "expect": "str\\s+r0, \\[sp, #0\\]"
+      },
+      "sources": [
+        16
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C9",
+      "text": "In array loops, `T *p = &arr[i]; p->a = src[i];` instead of repeated `arr[i].a = src[i];` can swap the registers holding the strength-reduced pointers.",
+      "evidence": {
+        "a": "#include \"types.h\"\ntypedef struct { int a, b, c; } T;\nextern T arr[8];\nextern int src[8];\nvoid g(int);\nvoid f(void);\nvoid f(void) { int i; for (i = 0; i < 8; i++) { arr[i].a = src[i]; g(arr[i].b); arr[i].c = src[i]; } }\n",
+        "b": "#include \"types.h\"\ntypedef struct { int a, b, c; } T;\nextern T arr[8];\nextern int src[8];\nvoid g(int);\nvoid f(void);\nvoid f(void) { int i; for (i = 0; i < 8; i++) { T *p = &arr[i]; p->a = src[i]; g(p->b); p->c = src[i]; } }\n",
+        "expect": "adds\\s+r5, #12"
+      },
+      "sources": [
+        17
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C10",
+      "text": "A large local initializer such as `u16 a[41] = {1, 2};` copies anonymous rodata (`<data:SIZE:HASH>`, so every value must be exact) with a count-down `ldrh`/`strh` loop, unlike a hand-written copy loop from a named table.",
+      "evidence": {
+        "a": "#include \"types.h\"\nvoid u(u16 *p);\nvoid f(void);\nvoid f(void) { u16 a[41] = { 1, 2, 3, 4, 5 }; u(a); }\n",
+        "b": "#include \"types.h\"\nextern const u16 tbl[41];\nvoid u(u16 *p);\nvoid f(void);\nvoid f(void) { u16 a[41]; int i; for (i = 0; i < 41; i++) a[i] = tbl[i]; u(a); }\n",
+        "expect": "subs\\s+r1, r1, #1"
+      },
+      "sources": [
+        19
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C11",
+      "text": "`if (x == 3 || x == 4)` folds to a range check (`subs #3; cmp #1; bhi`), while `switch (x) { case 3: case 4: }` emits separate `cmp`/branch pairs.",
+      "evidence": {
+        "a": "#include \"types.h\"\nvoid g(void);\nvoid f(int x);\nvoid f(int x) { if (x == 3 || x == 4) g(); }\n",
+        "b": "#include \"types.h\"\nvoid g(void);\nvoid f(int x);\nvoid f(int x) { switch (x) { case 3: case 4: g(); break; } }\n",
+        "expect": "subs\\s+r0, r0, #3"
+      },
+      "sources": [
+        20
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C12",
+      "text": "`d->sub.arr[i] = x;` adds the member offset on every store, while `Sub *s = &d->sub; s->arr[i] = x;` adds the struct offset once and puts the array offset in the `strb` immediate.",
+      "evidence": {
+        "a": "#include \"types.h\"\ntypedef struct { int n; u8 arr[8]; } Sub;\ntypedef struct { int pad[10]; Sub sub; } D;\nvoid f(D *d, int i, int x);\nvoid f(D *d, int i, int x) { d->sub.arr[i] = x; d->sub.arr[i + 1] = x; d->sub.arr[i + 2] = x; }\n",
+        "b": "#include \"types.h\"\ntypedef struct { int n; u8 arr[8]; } Sub;\ntypedef struct { int pad[10]; Sub sub; } D;\nvoid f(D *d, int i, int x);\nvoid f(D *d, int i, int x) { Sub *s = &d->sub; s->arr[i] = x; s->arr[i + 1] = x; s->arr[i + 2] = x; }\n",
+        "expect": "adds\\s+r2, #44"
+      },
+      "sources": [
+        23
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C13",
+      "text": "If a loop counter and a strength-reduced pointer have swapped callee-saved registers, try separate counters per loop (`i`, `j`) instead of reusing one.",
+      "evidence": {
+        "a": "#include \"types.h\"\ntypedef struct { int a, b, c; } T;\nextern T arr[8];\nvoid g(int);\nvoid f(void);\nvoid f(void) { int i; for (i = 0; i < 4; i++) g(i); for (i = 0; i < 8; i++) { g(arr[i].a); g(i); } }\n",
+        "b": "#include \"types.h\"\ntypedef struct { int a, b, c; } T;\nextern T arr[8];\nvoid g(int);\nvoid f(void);\nvoid f(void) { int i; int j; for (i = 0; i < 4; i++) g(i); for (j = 0; j < 8; j++) { g(arr[j].a); g(j); } }\n",
+        "expect": "adds\\s+r5, #12"
+      },
+      "sources": [
+        28
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C14",
+      "text": "Storing -1 in a loop `a[i] = -1;` emits `subs r0, r1, #1` (from a zero register) for an `s8` array but `movs r0, #255` for a `u8` array.",
+      "evidence": {
+        "a": "#include \"types.h\"\nvoid u(void *);\nvoid f(void);\nvoid f(void) { s8 a[8]; int i; for (i = 0; i < 8; i++) a[i] = -1; u(a); }\n",
+        "b": "#include \"types.h\"\nvoid u(void *);\nvoid f(void);\nvoid f(void) { u8 a[8]; int i; for (i = 0; i < 8; i++) a[i] = -1; u(a); }\n",
+        "expect": "subs\\s+r0, r1, #1"
+      },
+      "sources": [
+        29
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C15",
+      "text": "With an `s16 i`, `i < NELEMS(arr)` compares unsigned (`bcc`), while `i < 60` compares signed (`blt`).",
+      "evidence": {
+        "a": "#include \"types.h\"\nextern int arr[60];\nvoid g(int);\nvoid f(void);\nvoid f(void) { s16 i; for (i = 0; i < NELEMS(arr); i++) g(arr[i]); }\n",
+        "b": "#include \"types.h\"\nextern int arr[60];\nvoid g(int);\nvoid f(void);\nvoid f(void) { s16 i; for (i = 0; i < 60; i++) g(arr[i]); }\n",
+        "expect": "bcc"
+      },
+      "sources": [
+        31
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C16",
+      "text": "`(g(0) + g(1)) / 2` with `u32` returns divides unsigned (`lsrs #1`), while `(int)(g(0) + g(1)) / 2` emits the signed `lsrs #31; adds; asrs #1`.",
+      "evidence": {
+        "a": "#include \"types.h\"\nu32 g(int);\nint f(void);\nint f(void) { return (g(0) + g(1)) / 2; }\n",
+        "b": "#include \"types.h\"\nu32 g(int);\nint f(void);\nint f(void) { return (int)(g(0) + g(1)) / 2; }\n",
+        "expect": "asrs\\s+r0, r0, #1"
+      },
+      "sources": [
+        35
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C17",
+      "text": "`x = x - 7; k(x, ...);` on a `u16` local does the subtract before setting up stack arguments, while `k((u16)(x - 7), ...);` schedules it among them.",
+      "evidence": {
+        "a": "#include \"types.h\"\nu16 h(void); void k(int a, int b, int c, int d, int e, int f);\nvoid f(void);\nvoid f(void) { u16 x = h(); x = x - 7; k(x, 1, 2, 3, 4, 5); }\n",
+        "b": "#include \"types.h\"\nu16 h(void); void k(int a, int b, int c, int d, int e, int f);\nvoid f(void);\nvoid f(void) { u16 x = h(); k((u16)(x - 7), 1, 2, 3, 4, 5); }\n",
+        "expect": "subs\\s+r0, r0, #7"
+      },
+      "sources": [
+        42
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C18",
+      "text": "`for (i = 0; tbl[i] != 0xFFFF; i++)` over an extern table emits an entry check before the loop, while `do { ... i++; } while (tbl[i] != 0xFFFF);` does not.",
+      "evidence": {
+        "a": "#include \"types.h\"\nextern const u16 tbl[];\nvoid g(int);\nvoid f(void);\nvoid f(void) { int i; for (i = 0; tbl[i] != 0xFFFF; i++) g(tbl[i]); }\n",
+        "b": "#include \"types.h\"\nextern const u16 tbl[];\nvoid g(int);\nvoid f(void);\nvoid f(void) { int i = 0; do { g(tbl[i]); i++; } while (tbl[i] != 0xFFFF); }\n",
+        "expect": "beq"
+      },
+      "sources": [
+        43
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C19",
+      "text": "A NULL test on a value just copied with `adds rN, rM, #0` needs no `cmp`: `if (p != NULL)` branches on the copy's flags, while `if (p != (int *)4)` emits `cmp rN, #4`.",
+      "evidence": {
+        "a": "#include \"types.h\"\nvoid k(int *); void f(int a, int *p); void f(int a, int *p) { if (p != NULL) { k(p); k(p); } k((int *)a); }\n",
+        "b": "#include \"types.h\"\nvoid k(int *); void f(int a, int *p); void f(int a, int *p) { if (p != (int *)4) { k(p); k(p); } k((int *)a); }\n",
+        "expect": "cmp\\s+r4, #4"
+      },
+      "sources": [
+        47
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C20",
+      "text": "`arr[i].a = 0;` in a loop is strength-reduced to a pointer stepped by the element size (`adds r3, #3`), unlike manual byte offsets `*((u8 *)arr + i * 3)`, so write plain indexing.",
+      "evidence": {
+        "a": "#include \"types.h\"\ntypedef struct { u8 a, b, c; } S; extern S arr[]; void f(int n); void f(int n) { int i; for (i = 0; i < n; i++) arr[i].a = 0; }\n",
+        "b": "#include \"types.h\"\ntypedef struct { u8 a, b, c; } S; extern S arr[]; void f(int n); void f(int n) { int i; for (i = 0; i < n; i++) *(u8 *)((u8 *)arr + i * 3) = 0; }\n",
+        "expect": "strb\\s+r1, \\[r3, #0\\]"
+      },
+      "sources": [
+        49
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C21",
+      "text": "`A a = f();` for a returned struct builds it in a temporary and then copies it, while `A a; a = f();` can drop the copy when only a member is then read.",
+      "evidence": {
+        "a": "#include \"types.h\"\ntypedef struct { u16 x, y, z; } A; A h(void); void k(int); void f(void); void f(void) { A a = h(); k(a.x); }\n",
+        "b": "#include \"types.h\"\ntypedef struct { u16 x, y, z; } A; A h(void); void k(int); void f(void); void f(void) { A a; a = h(); k(a.x); }\n",
+        "expect": "strh\\s+r1, \\[r0, #6\\]"
+      },
+      "sources": [
+        56
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C22",
+      "text": "Assigning an all-zero compound literal `s->v = (V){0, 0, 0};` stores zeros with `str`, while a non-zero one `(V){1, 2, 3}` copies from anonymous rodata (`ldr rN, =<data:...>`).",
+      "evidence": {
+        "a": "#include \"types.h\"\ntypedef struct { int x, y, z; } V; typedef struct { int p; V v; } S; void f(S *s); void f(S *s) { s->v = (V){0, 0, 0}; }\n",
+        "b": "#include \"types.h\"\ntypedef struct { int x, y, z; } V; typedef struct { int p; V v; } S; void f(S *s); void f(S *s) { s->v = (V){1, 2, 3}; }\n",
+        "expect": "ldr\\s+r3, =<data"
+      },
+      "sources": [
+        57
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C23",
+      "text": "A constant aggregate initializer inside a loop body (`for (...) { V s = {4096, 4096, 4096}; g(&s); }`) is loaded into a hidden temporary once before the loop body and copied from it into `s` every iteration, so an early copy can belong to a loop-body local.",
+      "evidence": {
+        "a": "#include \"types.h\"\ntypedef struct { int x, y, z; } V; void g(V *); void f(int n); void f(int n) { int i; for (i = 0; i < n; i++) { V s = {4096, 4096, 4096}; g(&s); } }\n",
+        "b": "#include \"types.h\"\ntypedef struct { int x, y, z; } V; void g(V *); void f(int n); void f(int n) { int i; V s = {4096, 4096, 4096}; for (i = 0; i < n; i++) { g(&s); } }\n",
+        "expect": "ldmia\\s+r6!"
+      },
+      "sources": [
+        59
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C24",
+      "text": "Declaration order can set the stack slots of spilled scalar locals: with both spilled, `int a; int b;` put `a` above `b`, and `int b; int a;` swapped them.",
+      "evidence": {
+        "a": "#include \"types.h\"\nint h(int); void k(int, int); void f(int n); void f(int n) { int a; int b; int c; int i; int s = 0; a = h(0); b = h(1); c = h(2); for (i = 0; i < n; i++) { s += h(i); k(s, i); k(s, i); k(s, n); } k(a, b); k(c, 0); }\n",
+        "b": "#include \"types.h\"\nint h(int); void k(int, int); void f(int n); void f(int n) { int b; int a; int c; int i; int s = 0; a = h(0); b = h(1); c = h(2); for (i = 0; i < n; i++) { s += h(i); k(s, i); k(s, i); k(s, n); } k(a, b); k(c, 0); }\n",
+        "expect": "ldr\\s+r1, \\[sp, #0\\]"
+      },
+      "sources": [
+        66
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C25",
+      "text": "A jump-table switch lays out case bodies in source order (writing `case 3:` before `case 0:` moves its body first), so order the C cases by body address after decoding the table.",
+      "evidence": {
+        "a": "#include \"types.h\"\nvoid k(int); void f(int x); void f(int x) { switch (x) { case 0: k(10); break; case 1: k(21); break; case 2: k(32); break; case 3: k(43); k(44); k(45); break; case 4: k(54); break; } k(0); }\n",
+        "b": "#include \"types.h\"\nvoid k(int); void f(int x); void f(int x) { switch (x) { case 3: k(43); k(44); k(45); break; case 0: k(10); break; case 1: k(21); break; case 2: k(32); break; case 4: k(54); break; } k(0); }\n",
+        "expect": "movs\\s+r4, r3"
+      },
+      "sources": [
+        68
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C26",
+      "text": "A small `switch (x)` on 0/1/2 emits all compares first (in ascending value order) and then the bodies in source order, while `if (x == 0) ... else if (x == 1) ...` places each `cmp`/`bne` just before its body.",
+      "evidence": {
+        "a": "#include \"types.h\"\nvoid k(int); void f(int x); void f(int x) { switch (x) { case 0: k(10); break; case 1: k(21); break; case 2: k(32); break; } k(0); }\n",
+        "b": "#include \"types.h\"\nvoid k(int); void f(int x); void f(int x) { if (x == 0) { k(10); } else if (x == 1) { k(21); } else if (x == 2) { k(32); } k(0); }\n",
+        "expect": "beq\\.n\\s+\\.L2"
+      },
+      "sources": [
+        69
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C27",
+      "text": "Comparison constants are kept as written: `x < 8` emits `cmp #8; bge`, while `x <= 7` emits `cmp #7; bgt`.",
+      "evidence": {
+        "a": "#include \"types.h\"\nvoid k(int); void f(int x); void f(int x) { if (x < 8) k(1); k(0); }\n",
+        "b": "#include \"types.h\"\nvoid k(int); void f(int x); void f(int x) { if (x <= 7) k(1); k(0); }\n",
+        "expect": "cmp\\s+r0, #8"
+      },
+      "sources": [
+        72
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C28",
+      "text": "Assigning an int expression to a narrow local truncates at the assignment (`u16 v = x + 3;` adds `lsls #16; lsrs #16`, `u8` uses #24, even if the value already fits), while `int v` does not.",
+      "evidence": {
+        "a": "#include \"types.h\"\nvoid k(int); void f(int x); void f(int x) { u16 v = x + 3; k(v); k(v); }\n",
+        "b": "#include \"types.h\"\nvoid k(int); void f(int x); void f(int x) { int v = x + 3; k(v); k(v); }\n",
+        "expect": "lsls.*#16"
+      },
+      "sources": [
+        76
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C29",
+      "text": "Parentheses control constant arithmetic order: `a + b - 5` adds then subtracts, while `a + (b - 5)` subtracts from `b` first.",
+      "evidence": {
+        "a": "#include \"types.h\"\nint f(int a, int b); int f(int a, int b) { return a + b - 5; }\n",
+        "b": "#include \"types.h\"\nint f(int a, int b); int f(int a, int b) { return a + (b - 5); }\n",
+        "expect": "subs\\s+r1, r1, #5"
+      },
+      "sources": [
+        79
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C30",
+      "text": "Operand order of a multiply can set load order: `s->a * s->b` loads `a` first and `s->b * s->a` loads `b` first.",
+      "evidence": {
+        "a": "#include \"types.h\"\ntypedef struct { int a, b; } S; int f(S *s); int f(S *s) { return s->a * s->b; }\n",
+        "b": "#include \"types.h\"\ntypedef struct { int a, b; } S; int f(S *s); int f(S *s) { return s->b * s->a; }\n",
+        "expect": "ldr\\s+r1, \\[r0, #0\\]"
+      },
+      "sources": [
+        80
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C31",
+      "text": "Address-taken locals of one block (scalars, arrays, structs) are placed by declaration order, the earlier declared at the higher stack address: `T t; int ids[6];` puts `ids` below `t`.",
+      "evidence": {
+        "a": "#include \"types.h\"\ntypedef struct { int a[5]; } T; void g(void *, void *); void f(void); void f(void) { T t; int ids[6]; g(&t, ids); }\n",
+        "b": "#include \"types.h\"\ntypedef struct { int a[5]; } T; void g(void *, void *); void f(void); void f(void) { int ids[6]; T t; g(&t, ids); }\n",
+        "expect": "add\\s+r0, sp, #24"
+      },
+      "sources": [
+        81
+      ],
+      "verified": "2026-11-26"
+    },
+    {
+      "id": "C32",
+      "text": "Local declaration order affects which register each local gets (and can decide which one is spilled): `int i; int *r = NULL;` versus `int *r = NULL; int i;` swaps r4/r5.",
+      "evidence": {
+        "a": "#include \"types.h\"\nint *h(int); int c(int *); int *f(void); int *f(void) { int i; int *r = NULL; for (i = 0; i < 6; i++) { if (c(h(i))) r = h(i); } return r; }\n",
+        "b": "#include \"types.h\"\nint *h(int); int c(int *); int *f(void); int *f(void) { int *r = NULL; int i; for (i = 0; i < 6; i++) { if (c(h(i))) r = h(i); } return r; }\n",
+        "expect": "movs\\s+r5, #0"
+      },
+      "sources": [
+        85
+      ],
+      "verified": "2026-11-26"
+    }
+  ]
+}

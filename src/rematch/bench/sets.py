@@ -89,3 +89,32 @@ def save_set(conn: sqlite3.Connection, sid: str, ids: list[int], seed: int, cuto
             "VALUES (?, ?, ?, ?, ?)",
             (sid, json.dumps(ids), seed, cutoff, datetime.now(UTC).isoformat(timespec="seconds")),
         )
+
+
+def live_sample(conn: sqlite3.Connection, n: int, seed: int) -> list[int]:
+    """`n` untried assembly functions, stratified by size bucket in proportion to what remains.
+
+    For live pilots: the real work, with no human C and no human-written types for the target.
+    """
+    rows = conn.execute(
+        "SELECT id, n_insns FROM functions"
+        " WHERE source_kind = 'asm' AND status = 'untried' AND n_insns IS NOT NULL ORDER BY id"
+    ).fetchall()
+    by_bucket: dict[str, list[int]] = {name: [] for name, _, _ in BUCKETS}
+    for fid, n_insns in rows:
+        by_bucket[bucket(int(n_insns))].append(int(fid))
+    total = sum(len(v) for v in by_bucket.values())
+    if total == 0:
+        return []
+    n = min(n, total)
+    exact = {k: n * len(v) / total for k, v in by_bucket.items()}
+    quota = {k: int(x) for k, x in exact.items()}
+    for k in sorted(exact, key=lambda k: exact[k] - quota[k], reverse=True)[
+        : n - sum(quota.values())
+    ]:
+        quota[k] += 1
+    rng = random.Random(seed)
+    picked: list[int] = []
+    for k, ids in by_bucket.items():
+        picked += rng.sample(ids, quota[k])
+    return sorted(picked)

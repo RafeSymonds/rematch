@@ -1,13 +1,44 @@
 # Task: match {{ symbol }} ({{ mode }}, {{ n_insns }} instructions, module {{ module }})
 
-Files:
-- target.s: the original assembly for {{ symbol }} (and its literal pool)
-- ctx.h: types, prototypes, constants
-- examples/: {{ examples|length }} similar functions with matching C
-{% if draft %}- draft.c: an automatic first draft (often wrong in details){% endif %}
-{% if previous_best %}- previous_best.c / previous_best.diff: best earlier attempt ({{ previous_best_score }}%){% endif %}
+This message already contains target.s, the declarations from ctx.h that this function
+needs, and LEARNINGS.md. You don't need to open those files.
+
+## target.s
+
+```
+{{ target_s }}
+```
+
+## Declarations you need (cut from ctx.h; line numbers refer to ctx.h)
+
+```c
+{{ declarations if declarations else "/* none found: grep ctx.h by name */" }}
+```
+
+## Other files
+
+- ctx.h: the full context ({{ ctx_kb }} KB). Grep it for specific names; never read it whole.
+- examples/: {{ examples|length }} similar functions with matching C{% if examples %} ({{ examples|join(", ") }}){% endif %}
+
+{% if draft %}
+- draft.c: an automatic first draft from m2c (often wrong in details). candidate.c starts as a copy of it.
+{% endif %}
+{% if previous_best %}
+- previous_best.c / previous_best.diff: best earlier attempt ({{ previous_best_score }}%)
+{% endif %}
+
+## LEARNINGS.md
+
+{{ learnings }}
 
 Budget: at most {{ max_checks }} runs of ./check. Stop early if you match.
-{% if version_cond %}This function is checked against every target version.{% endif %}
+{% if version_cond %}
+This function is checked against every target version.
+{% endif %}
+{% if asm_target %}
+Data that target.s loads from its literal pool by name (`ldr rN, =NAME`) is defined in the
+assembly file, which stays as it is. Declare it `extern` with exactly that name and a fitting
+type; don't define it in candidate.c.
+{% endif %}
 
 Write the function {{ symbol }} in candidate.c, run ./check, iterate to MATCH.

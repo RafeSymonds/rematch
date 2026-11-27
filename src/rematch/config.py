@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     anthropic_api_key: SecretStr = SecretStr("")
     worker_model: str = "sonnet"
     worker_effort: str = "high"
+    # Effort per size bucket (S/M/L, SPEC §11.2) when --effort isn't given; empty = WORKER_EFFORT.
+    effort_by_size: str = "S:medium,M:high,L:high"
     escalation_ladder: str = "sonnet:high,sonnet:xhigh,opus:high,opus:xhigh"
     max_turns: int = Field(default=60, ge=1)
     max_checks: int = Field(default=40, ge=1)
@@ -39,10 +41,14 @@ class Settings(BaseSettings):
     max_attempts_per_function: int = Field(default=4, ge=1)
     retry_cooldown_min: int = Field(default=240, ge=0)
     examples_k: int = Field(default=3, ge=0)
+    # After a run, suggest `rematch learnings curate` once this many candidates are pending.
+    curate_pending_threshold: int = Field(default=50, ge=1)
+    examples_mode: Literal["naive", "similar"] = "similar"  # SPEC §6.7; naive = Phase 2 baseline
     reference_repos: str = ""
     diff_backend: Literal["objdiff", "objdump"] = "objdump"
     objdiff_bin: str = "objdiff-cli"
     objdump: str = "objdump"
+    m2c: str = ""  # path to m2c.py for draft.c seeding (Phase 3 B2); empty = no drafts
     ctags: str = "ctags"
     bench_cutoff_date: str = "2026-07-01"
     compile_timeout_sec: float = Field(default=20, gt=0)
@@ -59,6 +65,10 @@ class Settings(BaseSettings):
     def _expand_user(cls, value: Path | None) -> Path | None:
         # Absolute from here on: these paths are handed to processes running in sandboxes.
         return None if value is None else value.expanduser().resolve()
+
+    def effort_for_size(self, size_bucket: str) -> str:
+        table = dict(part.split(":", 1) for part in self.effort_by_size.split(",") if ":" in part)
+        return table.get(size_bucket, self.worker_effort)
 
     def version_override(self) -> list[str]:
         """`TARGET_VERSIONS` as a list. Empty means use target.toml `default_versions`."""

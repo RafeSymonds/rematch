@@ -106,6 +106,7 @@ def inventory(
 def cd(
     sandbox: Path = typer.Option(Path("."), help="Sandbox directory."),
     json_out: Path | None = typer.Option(None, help="Also write the result JSON here."),
+    control: Path | None = typer.Option(None, help="Control dir (task.json); default: sandbox."),
     mode: str = typer.Option("isolated", help="Compile mode (only isolated in Phase 1)."),
 ) -> None:
     """Compile candidate.c and diff it against the target (what ./check runs)."""
@@ -114,7 +115,7 @@ def cd(
     if mode != "isolated":
         typer.echo(f"mode {mode!r} is not available yet")
         raise typer.Exit(2)
-    text, code, _ = run_check(sandbox.resolve(), json_out)
+    text, code, _ = run_check(sandbox.resolve(), json_out, control.resolve() if control else None)
     typer.echo(text)
     raise typer.Exit(code)
 
@@ -283,16 +284,19 @@ def bench(
     n: int = typer.Option(..., help="Set size."),
     seed: int = typer.Option(42),
     pool: str = typer.Option("clean", help="clean or contaminated (§11.1)."),
+    size_bucket: str | None = typer.Option(
+        None, "--bucket", help="Only one size bucket: S, M or L (set id gets -S/-M/-L)."
+    ),
     workers: int | None = typer.Option(None, help="Parallel attempts (default WORKER_COUNT)."),
     model: str | None = typer.Option(None),
     effort: str | None = typer.Option(None),
     yes: bool = typer.Option(False, "--yes", help="Confirm token spend."),
 ) -> None:
     """Run a frozen bench set with real workers (spends tokens)."""
-    from rematch.bench.pool import Prescreen, pool_sizes
+    from rematch.bench.pool import Prescreen, PrescreenError, pool_sizes
     from rematch.bench.report import append_row, benchmarks_row, format_report, run_metrics
     from rematch.bench.run import run_functions
-    from rematch.bench.sets import load_set, save_set, set_id, stratified_sample
+    from rematch.bench.sets import bucket, load_set, save_set, set_id, stratified_sample
     from rematch.target.definition import target_dir
     from rematch.worker.sandbox import find_function
 
@@ -301,15 +305,28 @@ def bench(
         raise typer.Exit(2)
     s = _session()
     cutoff = s.settings.bench_cutoff_date
+    if size_bucket not in (None, "S", "M", "L"):
+        typer.echo("--bucket must be S, M or L")
+        raise typer.Exit(2)
     sid = set_id(n, seed, cutoff) + ("" if pool == "clean" else "-contaminated")
+    sid += f"-{size_bucket}" if size_bucket else ""
     conn = store.connect(s.db_path)
     try:
         ids = load_set(conn, sid)
         if ids is None:
             sizes = pool_sizes(conn, pool, cutoff)
+            if size_bucket:
+                sizes = {k: v for k, v in sizes.items() if bucket(v) == size_bucket}
             typer.echo(f"pool {pool}: {len(sizes)} functions; building set {sid}")
             prescreen = Prescreen(s, conn, _echo_err, s.settings.worker_count)
-            ids, rejected = stratified_sample(sizes, n, seed, prescreen.eligible)
+            try:
+                ids, rejected = stratified_sample(sizes, n, seed, prescreen.eligible)
+            except PrescreenError as exc:
+                typer.echo(f"FAIL {exc}; set not saved")
+                raise typer.Exit(1) from exc
+            if len(ids) < min(n, len(sizes)) // 2:
+                typer.echo(f"FAIL only {len(ids)} eligible functions; set not saved")
+                raise typer.Exit(1)
             save_set(conn, sid, ids, seed, cutoff)
             typer.echo(f"set {sid}: {len(ids)} functions ({len(rejected)} failed the pre-screen)")
         fns = []
@@ -321,18 +338,21 @@ def bench(
     finally:
         conn.close()
     m, e = _model_effort(model, effort)
+    effort_for = {} if effort else _effort_by_size(s, [fn.id for fn in fns])
     _confirm_spend(f"bench {sid}", len(fns), yes)
     result = run_functions(
         s,
         "bench",
         fns,
         model=m,
-        effort=e,
+        effort="by-size" if effort_for else e,
         workers=workers or s.settings.worker_count,
         bench=True,
         seed=seed,
         log=_echo_err,
         bench_set=sid,
+        effort_for=effort_for,
+        extra_config={"effort_by_size": s.settings.effort_by_size if effort_for else None},
     )
     conn = store.connect(s.db_path)
     try:
@@ -343,6 +363,57 @@ def bench(
     row = benchmarks_row(metrics, s.definition.name, "baseline" if seed == 42 else "")
     path = append_row(target_dir(s.settings.target_repo), row)
     typer.echo(f"row appended to {path}")
+
+
+@app.command()
+def pilot(
+    n: int = typer.Option(50, help="Untried assembly functions to attempt."),
+    seed: int = typer.Option(1),
+    workers: int | None = typer.Option(None),
+    model: str | None = typer.Option(None),
+    effort: str | None = typer.Option(None),
+    yes: bool = typer.Option(False, "--yes", help="Confirm token spend."),
+) -> None:
+    """Live attempts on a size-stratified sample of untried assembly functions (spends tokens)."""
+    from rematch.bench.report import format_report, run_metrics
+    from rematch.bench.run import run_functions
+    from rematch.bench.sets import live_sample
+    from rematch.worker.sandbox import load_functions
+
+    s = _session()
+    conn = store.connect(s.db_path)
+    try:
+        ids = live_sample(conn, n, seed)
+        fns = load_functions(conn, ids)
+    finally:
+        conn.close()
+    if not fns:
+        typer.echo("no untried assembly functions")
+        raise typer.Exit(1)
+    m, e = _model_effort(model, effort)
+    effort_for = {} if effort else _effort_by_size(s, [fn.id for fn in fns])
+    _confirm_spend(f"pilot ({len(fns)} live functions)", len(fns), yes)
+    result = run_functions(
+        s,
+        "live",
+        fns,
+        model=m,
+        effort="by-size" if effort_for else e,
+        workers=workers or s.settings.worker_count,
+        bench=False,
+        seed=seed,
+        log=_echo_err,
+        effort_for=effort_for,
+        extra_config={
+            "pilot": {"n": n, "seed": seed, "function_ids": ids},
+            "effort_by_size": s.settings.effort_by_size if effort_for else None,
+        },
+    )
+    conn = store.connect(s.db_path)
+    try:
+        typer.echo(format_report(run_metrics(conn, result.run_id)))
+    finally:
+        conn.close()
 
 
 @app.command()
@@ -394,3 +465,154 @@ def report(
             typer.echo(format_report(run_metrics(conn, compare)))
     finally:
         conn.close()
+
+
+def _effort_by_size(s: Session, ids: list[int]) -> dict[int, str]:
+    """EFFORT_BY_SIZE applied per function (empty setting: no per-size effort)."""
+    from rematch.bench.sets import bucket
+
+    if not s.settings.effort_by_size:
+        return {}
+    conn = store.connect(s.db_path)
+    try:
+        marks = ",".join("?" * len(ids))
+        rows = conn.execute(
+            f"SELECT id, n_insns FROM functions WHERE id IN ({marks})", ids
+        ).fetchall()
+    finally:
+        conn.close()
+    return {int(fid): s.settings.effort_for_size(bucket(int(n or 0))) for fid, n in rows}
+
+
+learnings_app = typer.Typer(no_args_is_help=True, help="Curate worker-proposed learnings (D9).")
+app.add_typer(learnings_app, name="learnings")
+
+
+@learnings_app.command("review")
+def learnings_review(
+    list_only: bool = typer.Option(False, "--list", help="Print pending candidates and exit."),
+    accept: list[int] = typer.Option([], "--accept", help="Candidate ids to accept."),
+    to: str = typer.Option("compiler", "--to", help="compiler (rematch) or target (.rematch/)."),
+    reject: list[int] = typer.Option([], "--reject", help="Candidate ids to reject."),
+) -> None:
+    """Accept or reject learning candidates by hand; accepted ones become rules (no evidence)."""
+    import sys
+
+    from rematch.learnings.curate import decide, pending
+    from rematch.learnings.curate_run import rule_files
+    from rematch.learnings.rules import MAX_LINES, Rule
+
+    s = _session()
+    comp, tgt = rule_files(s)
+    files = {"compiler": comp, "target": tgt}
+    if to not in files:
+        typer.echo("--to must be compiler or target")
+        raise typer.Exit(2)
+    conn = store.connect(s.db_path)
+    try:
+        todo = dict(pending(conn))
+        if list_only:
+            for cid, text in todo.items():
+                typer.echo(f"{cid}: {text}")
+            typer.echo(f"{len(todo)} pending")
+            return
+        decisions: list[tuple[int, str | None]] = [(c, to) for c in accept] + [
+            (c, None) for c in reject
+        ]
+        if not decisions and sys.stdin.isatty():
+            for cid, text in todo.items():
+                typer.echo(f"\n[{cid}] {text}")
+                choice = typer.prompt("c=compiler t=target r=reject s=skip q=quit", default="s")
+                if choice == "q":
+                    break
+                if choice in ("c", "t", "r"):
+                    decisions.append((cid, {"c": "compiler", "t": "target"}.get(choice)))
+        for cid, dest in decisions:
+            if cid not in todo:
+                typer.echo(f"{cid}: not pending; skipped")
+                continue
+            if dest is not None:
+                f = files[dest]
+                text = " ".join(todo[cid].split())
+                if any(r.text == text for r in f.rules):
+                    typer.echo(f"{cid}: already in {f.path.name}")
+                else:
+                    rid = f.next_id("T" if dest == "target" else "C")
+                    f.rules.append(Rule(rid, text, None, [cid]))  # no evidence: unverified
+                    typer.echo(f"{cid}: added as {rid} to {f.path}")
+            decide(conn, cid, accept=dest is not None)
+    finally:
+        conn.close()
+    for name, f in files.items():
+        f.save()
+        if len(f.rules) > MAX_LINES:
+            typer.echo(f"warning: {name} has {len(f.rules)} rules (cap {MAX_LINES})")
+
+
+@app.command("try")
+def try_cmd(
+    a: Path = typer.Argument(..., help="First C snippet."),
+    b: Path = typer.Argument(..., help="Second C snippet."),
+    control: Path = typer.Option(..., help="Control dir with trial.json."),
+) -> None:
+    """Compile two snippets with the target's compiler and show how their code differs."""
+    from rematch.learnings.trial import Compiler, run_trial
+    from rematch.toolchain.runner import ToolchainRunner
+    from rematch.worker.task import CompileSpec
+
+    cfg = json.loads((control / "trial.json").read_text(encoding="utf-8"))
+    compiler = Compiler(
+        CompileSpec(**cfg["compile"]).entry(),
+        ToolchainRunner.from_spec(cfg["toolchain_exec"]),
+        cfg["objdump"],
+        float(cfg["timeout"]),
+        cfg["header"],
+    )
+    trial = run_trial(
+        compiler, a.read_text(encoding="utf-8"), b.read_text(encoding="utf-8"), control / "try"
+    )
+    typer.echo(trial.report())
+    raise typer.Exit(0 if trial.ok else 1)
+
+
+@learnings_app.command("curate")
+def learnings_curate(
+    batch: int = typer.Option(40, help="Candidates per curation run."),
+    model: str | None = typer.Option(None),
+    effort: str = typer.Option("medium"),
+    yes: bool = typer.Option(False, "--yes", help="Confirm token spend."),
+) -> None:
+    """An agent curates pending candidates; rematch verifies its evidence before applying."""
+    from rematch.learnings.curate_run import run_curation
+
+    s = _session()
+    _confirm_spend("learnings curate", 1, yes)
+    conn = store.connect(s.db_path)
+    try:
+        applied, cost = run_curation(
+            s, conn, batch, model or s.settings.worker_model, effort, _echo_err
+        )
+    finally:
+        conn.close()
+    typer.echo(f"accepted {applied.accepted}")
+    typer.echo(f"dropped by the evidence check {applied.dropped}")
+    typer.echo(f"merged {applied.merged}; rejected {len(applied.rejected)}")
+    typer.echo(f"rewritten {applied.rewritten}; retired {applied.retired}")
+    if applied.moved_to_target:
+        typer.echo(f"moved to target scope (named target code): {applied.moved_to_target}")
+    typer.echo(f"cost ${cost:.3f} (estimate)")
+
+
+@learnings_app.command("verify")
+def learnings_verify(
+    retire: bool = typer.Option(False, help="Remove rules whose evidence no longer holds."),
+) -> None:
+    """Re-run every rule's evidence with the target compiler (no tokens)."""
+    from rematch.learnings.curate_run import verify_all
+
+    s = _session()
+    results = verify_all(s, retire, _echo_err)
+    for rid, ok, why in results:
+        typer.echo(f"{'SKIP' if ok is None else 'PASS' if ok else 'FAIL'} {rid}: {why}")
+    if any(ok is False for _, ok, _ in results):
+        raise typer.Exit(1)

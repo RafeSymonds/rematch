@@ -65,7 +65,7 @@ Public decomp code is likely in model training data, so a benchmark built from o
 A match is accepted only if it passes lints: no inline asm, no new pragmas, no gratuitous `volatile`/`goto`/`do{}while(0)`, no `register` keyword abuse, and an identifier policy (see SPEC §9). Ugly matches poison future context (lesson from Lewis) and defeat the point of having source.
 
 ### D9. Learnings are curated, not append-only
-Workers propose learnings in `NOTES.md`. They land in a candidates table. A curation pass (human, or a cheap model with human approval) merges good ones into `LEARNINGS.md`, keeping it short and deduplicated. An ever-growing learnings file turns into noise and burns tokens on every attempt.
+Workers propose learnings in `NOTES.md`. They land in a candidates table. A curation pass merges good ones into the rule files, keeping them short and deduplicated. An ever-growing learnings file turns into noise and burns tokens on every attempt. Curation is an agent, but its claims are not trusted: each rule needs a pair of C snippets whose compiled code differs the way the rule says, and rematch recompiles that pair before accepting the rule and before every run (SPEC §13.1). Humans can still accept rules by hand.
 
 ### D10. Scheduling: easiest first, similarity-boosted, escalate the stuck
 Difficulty comes from size, branches, switch tables, literal pool size and unknown callees, minus a bonus for having a highly similar matched function. Untried functions go in difficulty order. Stuck functions get retried later with escalation: a stronger model, higher effort, TU-context compile, alternate drafts.

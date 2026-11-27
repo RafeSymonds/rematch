@@ -82,7 +82,7 @@ anonymous = "sub_{address:08X}"            # str.format; fields: address, overla
 overlay_anonymous = "ov{overlay:02d}_{address:08X}"
 ```
 
-Phase 1 sections are optional for validation, and the commands that need one fail with a message naming the missing table. `[build]` requires `build_dir` in every version. Formats are names of parsers implemented in rematch for toolchain and ecosystem formats (never per-game code). Adding a format means adding a parser with fixture tests. The `[context]` command runs through `TOOLCHAIN_EXEC` with cwd = the vanilla worktree, receives a stub `.c` containing `#include` lines as `{input}`, and prints a flattened context (types, prototypes and macro definitions) on stdout.
+Phase 1 sections are optional for validation, and the commands that need one fail with a message naming the missing table. `[build]` requires `build_dir` in every version. Formats are names of parsers implemented in rematch for toolchain and ecosystem formats (never per-game code). Adding a format means adding a parser with fixture tests. The `[context]` command runs through `TOOLCHAIN_EXEC` with cwd = the vanilla worktree, receives a stub `.c` containing `#include` lines as `{input}`, and prints a flattened context (types, prototypes and macro definitions) on stdout. An argument that is exactly `{includes}` expands to the TU's own `-I` flags from `compile_commands.json` (absolute), so the preprocessor sees the compiler's include path. A failing context command makes the function ineligible for a bench (`context_error`), not a harness error.
 
 ### 2.1.2 Phase 2 fields
 
@@ -95,6 +95,8 @@ address_version = "us"                     # version whose addresses the assembl
 
 [worker]
 intro = "The target is ... compiled with ..., Thumb mode unless target.s says otherwise."   # Appendix A {{ target_intro }}
+compiler = "mwcc-arm"        # compiler family: shares docs/learnings/<compiler>.json with other targets (§13.1)
+trial_header = "trial.h"     # optional, in .rematch/: the evidence header (typedefs + mode pragmas)
 ```
 
 ### 2.1.3 Phase 4 fields
@@ -150,7 +152,7 @@ rematch/
     integrate/tu_builder.py  integrate/lsf.py  integrate/verify.py
     bench/pool.py  bench/sets.py  bench/report.py
     lint/readability.py
-    learnings/candidates.py  learnings/curate.py
+    learnings/curate.py  learnings/rules.py  learnings/trial.py  learnings/curate_run.py   # §13.1
     types/provisional.py  types/probe.py  types/merge.py  types/reference.py   # §16
     naming/propose.py                                                          # §16.5
     selftest/oracle_agent.py  selftest/saboteur_agent.py
@@ -158,9 +160,9 @@ rematch/
     worker_system.md             # Appendix A (versioned: header line `prompt_version: N`)
     task.md.j2                   # Appendix B
     tu_data_task.md.j2
-    curate.md
+    curate.md  curate/types.h    # §13.1 curation agent and its default evidence header
   docs/
-    LEARNINGS.md                 # curated compiler quirks, injected into sandboxes
+    learnings/<compiler>.json    # compiler-scope rules (§13.1); .md alongside is generated
     verify-log.md                # evidence for resolved rematch VERIFY items
   tests/
   var/                           # gitignored: db, logs, bench sets (sandboxes live in REMATCH_WORKDIR, outside the repo)
@@ -190,6 +192,7 @@ This repo is target-agnostic: no game names, target paths, host names or persona
 | `ANTHROPIC_API_KEY` | (empty) | API mode only |
 | `WORKER_MODEL` | `sonnet` | Default model alias |
 | `WORKER_EFFORT` | `high` | |
+| `EFFORT_BY_SIZE` | `S:medium,M:high,L:high` | Effort per size bucket (§11.2) when `--effort` isn't given. Empty means `WORKER_EFFORT` for all. |
 | `ESCALATION_LADDER` | `sonnet:high,sonnet:xhigh,opus:high,opus:xhigh` | §8.4 |
 | `MAX_TURNS` | `60` | Passed as `--max-turns` |
 | `MAX_CHECKS` | `40` | Enforced by `./check` |
@@ -199,6 +202,7 @@ This repo is target-agnostic: no game names, target paths, host names or persona
 | `MAX_ATTEMPTS_PER_FUNCTION` | `4` | Before status `stuck` |
 | `RETRY_COOLDOWN_MIN` | `240` | |
 | `EXAMPLES_K` | `3` | Similar matched functions per sandbox |
+| `CURATE_PENDING_THRESHOLD` | `50` | After a run, suggest `learnings curate` once this many candidates are pending |
 | `REFERENCE_REPOS` | (empty) | Comma-separated paths to related decomp repos (same engine or compiler) for cross-repo examples (Phase 3) |
 | `DIFF_BACKEND` | `objdump` | `objdump` or `objdiff` (§6.5) |
 | `OBJDIFF_BIN` | `objdiff-cli` | |
@@ -396,7 +400,8 @@ For each function, produce a sandbox `ctx.h`:
 3. Flatten them via `make_context` (for example a target-provided m2ctx-style script run on a stub `.c` that includes those headers). Strip the target function's own prototype only if it would conflict. Keep it otherwise, because a correct prototype is legitimate info.
 4. Bench mode: the context must not contain the target's body. Headers never contain bodies, but static inline functions defined in headers are fine.
 5. Append the accepted shared types (§16.2) relevant to the function, after the flattened headers and before TU-local declarations: types used by matches in the same TU, by its callers or by its callees. Types not yet materialized in a header exist only here.
-6. Record `context_version` (bump whenever builder logic changes).
+6. The sandbox's TASK.md (the worker's first prompt) inlines `target.s`, `LEARNINGS.md`, and the declarations the function needs, cut from its own ctx.h with ctags (start/end lines): the target's prototype, its callees' prototypes, the externs and statics it references (relocation targets with addends stripped), and the struct/union/enum definitions those mention, one level deep (≤ 90 lines per type, ≤ 200 in total, each with its `ctx.h:<line>`). Phase 2 transcripts showed 81% of all tool output was workers grepping a ~1 MB ctx.h.
+7. Record `context_version` (bump whenever builder logic changes).
 
 ### 6.4 Compile-and-diff (`rematch cd`): the worker's only tool
 
@@ -430,7 +435,7 @@ Relocations are read as RELA; REL implicit addends are decoded from the patched 
 
 **Backends:**
 The backend only produces the rows for score, hints and rendering:
-- `objdump` (default): `$OBJDUMP -d -r --no-show-raw-insn`, relying on the objects' ARM mapping symbols for the mode (TARGET.md records whether a target's objects carry them). Lines are normalized: offsets relative to the function, local branch targets as `.L<k>` (numbered by target order), calls and pool loads show the normalized target (`ldr r0, =Symbol`, `ldr r0, =0x1f4`).
+- `objdump` (default): `$OBJDUMP -d -r -z --no-show-raw-insn` (`-z`: relocated literal-pool words are all zeros in RELA objects and would otherwise be collapsed into `...`), relying on the objects' ARM mapping symbols for the mode (TARGET.md records whether a target's objects carry them). Lines are normalized: offsets relative to the function, local branch targets as `.L<k>` (numbered by target order), calls and pool loads show the normalized target (`ldr r0, =Symbol`, `ldr r0, =0x1f4`).
 - `objdiff`: `objdiff-cli diff -1 A -2 B -o - --format json` has a one-shot mode, but it emits a whole-object `DiffResult`. Adopt it only if objdump rows prove insufficient.
 
 ### 6.6 Text rendering and hints (what the worker sees)
@@ -484,11 +489,13 @@ $REMATCH_WORKDIR/attempts/<attempt_id>/
   ctx.h            # §6.3
   examples/        # §6.7
   draft.c          # optional m2c draft (Phase 3)
-  LEARNINGS.md     # copy of docs/LEARNINGS.md
+  LEARNINGS.md     # compiler-scope then target-scope rules (§13.1)
   candidate.c      # starts as draft.c or a stub with the right signature if known
   check            # executable wrapper → rematch cd (§6.4)
-  task.json        # symbol, target symbol, TU, mode, per-version compile argv and context, limits
   ctx.<version>.h  # context for each extra version of a version-conditional TU
+
+$REMATCH_VAR/runs/<run>/<attempt>/control/   # outside the sandbox; workers are denied reading it
+  task.json        # symbol, target symbol, TU, mode, per-version compile argv and context, limits
   .target/         # normalized vanilla lines and match view per version (written by the builder)
   NOTES.md         # worker may append proposed learnings here
   SUMMARY.json     # worker writes at the end (untrusted)
@@ -497,7 +504,7 @@ $REMATCH_WORKDIR/attempts/<attempt_id>/
 
 Before launch: compute SHA-256 of every file except `candidate.c`, `NOTES.md`, `SUMMARY.json` and `.history/**`, and `chmod 0444` them (`check` 0555). The manifest is stored outside the sandbox (`var/runs/<run>/<attempt>/manifest.json`). After the attempt: re-hash. Any modified, missing or added file means outcome `invalid`. `./check` writes its scratch sources and objects under `.history/build/`, outside the seal. Sandboxes live at `REMATCH_WORKDIR/attempts/<attempt_id>`.
 
-Bench presentation (§7.2) also scrubs ctx.h: the target's prototype is renamed to the anonymous symbol, and comments are stripped from the TU-local declarations. `task.json` and `.target/` name the real symbol, so workers are denied reading them (§7.3).
+Bench presentation (§7.2) also scrubs ctx.h: the target's prototype is renamed to the anonymous symbol, and comments are stripped from the TU-local declarations. `task.json` and `.target/` name the real symbol, so they live in the attempt's control directory under `REMATCH_VAR` (read-denied, §7.3). The `check` script passes it to `rematch cd --control`. Workers kept trying to read `task.json` when it sat in the sandbox (15 denied tries in the baseline run).
 
 ### 7.2 Bench presentation rule
 
@@ -515,7 +522,7 @@ claude -p "$(cat TASK.md)" \
   --tools "Read,Edit,Write,Bash" \
   --allowedTools "Read" "Edit(candidate.c)" "Write(candidate.c)" "Edit(NOTES.md)" \
                  "Write(NOTES.md)" "Edit(SUMMARY.json)" "Write(SUMMARY.json)" "Bash(./check)" \
-  --disallowedTools "Read(task.json)" "Read(.target/**)" "Read(//<deny root>/**)" ... \
+  --disallowedTools "Read(//<deny root>/**)" ... \
   --permission-mode dontAsk --permission-prompts none \
   --setting-sources project,local \
   --strict-mcp-config --disable-slash-commands \
@@ -541,6 +548,7 @@ Notes:
 - Timeout: send SIGINT at `ATTEMPT_TIMEOUT_SEC`, which ends the turn cleanly, then SIGTERM after 30 s (exit 143), then SIGKILL after 10 s more.
 - Parse the final `result` event for `num_turns`, usage tokens and `total_cost_usd`. Cost is a client-side estimate.
 - Save the full stream to `var/logs/<run_id>/<attempt_id>.jsonl` (stderr next to it).
+- **Rate and usage limits:** a result whose error mentions a rate limit, usage limit, 429/529 or overload doesn't end the attempt. The run's shared gate pauses new attempts: until the stated reset time for usage limits (at most 6 h), otherwise exponential backoff (60 s doubling, at most 15 min). Then the same session is resumed with `--resume <session_id>` and a short "continue" prompt, which is why sessions are persisted (no `--no-session-persistence`). If the session can't be resumed, a fresh session continues in the same sandbox, where `candidate.c`, `.history/` and the check count survive. Turn and time budgets carry over, tokens and cost are summed across segments (`<attempt>.rN.jsonl`), and after 5 resumes the attempt is classified as usual.
 
 ### 7.4 Outcome classification
 
@@ -669,11 +677,31 @@ rematch run --workers W [--max-attempts K] [--until HH:MM]     # live loop
 rematch integrate [--tu TU | --ready | --verify-branch]        # --verify-branch: rebuild every rematch/live commit, check hashes
 rematch report [--run ID | --last] [--compare ID]
 rematch stuck --list | --show FUNCTION
-rematch learnings review            # interactive accept/reject of candidates
+rematch learnings review            # human accept/reject of candidates (rules without evidence)
+rematch learnings curate --yes      # agent curation; rematch verifies evidence before applying (§13.1)
+rematch learnings verify [--retire] # re-run every rule's evidence (no tokens)
+rematch try A.c B.c --control DIR   # the curation agent's ./try
 rematch types list | show NAME | merge [--cluster ID] [--tu TU]   # type recovery (§16.2)
 rematch names review                # interactive accept/reject of name proposals (§16.5)
 rematch sync-upstream
 ```
+
+### 13.1 Learnings
+
+Workers propose candidates in `NOTES.md` (`learning_candidates`). Accepted candidates become rules in one of two JSON files, each with a generated `.md` beside it:
+
+- compiler scope: `docs/learnings/<compiler>.json` in rematch, public and target-agnostic, shared by every target whose `[worker] compiler` names it
+- target scope: `<TARGET_REPO>/.rematch/learnings.json`
+
+A sandbox's `LEARNINGS.md` is both files' rules, compiler first. Each scope stays under 150 rules.
+
+`learnings curate` runs an agent in its own sandbox (CANDIDATES.md, RULES.md, `types.h`, `evidence/`, `./try`; tools limited to those files). For each candidate it decides accept, merge or reject, and it may rewrite or retire rules. An accepted rule must come with an evidence pair: two snippets that include only `types.h` (the target's `trial_header`, else `prompts/curate/types.h`) plus a regex `expect`. rematch then applies the decisions only after its own checks:
+
+1. It recompiles every accepted pair with the target's most common C compile flags. The rule is dropped unless both compile, their code differs, and a differing line matches `expect`.
+2. A compiler-scope rule whose text or evidence names a target identifier (inventory function names, header-index declarations) moves to target scope.
+3. Candidates are marked accepted or rejected.
+
+`learnings verify` recompiles every rule's evidence. Before each run, `ensure_verified` does the same, cached by a digest of the rules, the trial header and the pin, and the run aborts if any rule fails. The digest is recorded as `learnings_sha256` in the run config. Rules accepted by hand through `learnings review` carry no evidence and are reported as SKIP. After a run with at least `CURATE_PENDING_THRESHOLD` candidates pending, rematch suggests a curation pass. It never spends tokens on curation by itself.
 
 `rematch doctor` prints one `PASS`/`FAIL` line per check and exits 1 if any check fails. Checks, in order: `CLAUDE_BIN --version` ≥ 2.1.259 (spends no tokens); `REMATCH_WORKDIR` and ancestors clean (§4); `target.toml` valid (§2.1); no push URL in `TARGET_REPO` matches `forbidden_push_urls` and the installed pre-push hook matches `.rematch/pre-push` (§2.3); vanilla worktree at the pin (§6.2); `TOOLCHAIN_EXEC` runs `true` (if set); the toolchain sees `REMATCH_WORKDIR` (sandboxes are compiled through it); per-version build and hash (§6.2); `required_paths` present; `OBJDUMP` runs; `CTAGS` is Universal Ctags; DB migrated (§5).
 
@@ -741,12 +769,12 @@ Names don't change code bytes, but they make the source useful. A cheaper model 
 
 ---
 
-## Appendix A: `prompts/worker_system.md` (draft, prompt_version: 1)
+## Appendix A: `prompts/worker_system.md` (prompt_version: 2)
 
 `{{ target_intro }}` is filled from the target (a `target.toml` field added in Phase 2), for example the platform, compiler and default ISA mode.
 
 ```markdown
-prompt_version: 1
+prompt_version: 2
 
 You are doing matching decompilation. {{ target_intro }} Your job: write C in
 candidate.c that compiles to EXACTLY the instructions in target.s.
@@ -762,7 +790,11 @@ Rules:
   redundant casts). The code must read like plausible original source.
 - Name unknown struct fields unk_XX by hex offset. Do not invent meaningful
   names without evidence (callee names, strings, constants).
-- Use ctx.h for types and prototypes; do not redefine what it declares.
+- TASK.md already contains target.s, the declarations this function needs and
+  LEARNINGS.md. ctx.h (about 1 MB) has everything else: grep it for specific
+  names only, never read it whole. Do not redefine what it declares.
+- Write a first draft and run ./check within your first few turns. The diff
+  teaches more than reading; iterate from it.
 - If ctx.h has no type for a struct you access, declare one in the
   provisional-types block at the top of candidate.c:
     /* rematch:types */
@@ -774,9 +806,8 @@ Rules:
   <ADDR> is your function's address; add _1, _2 for more types. Fields are
   unk_XX by hex offset, gaps are u8 arrays. Prefer fields over pointer math
   like *(u16 *)((u8 *)p + 0x2C).
-- Read examples/ first: they are similar functions that already match. Copy
-  their idioms.
-- Read LEARNINGS.md: compiler quirks discovered so far.
+- examples/ holds similar functions that already match; skim one or two for
+  idioms when the diff is stuck, not before your first draft.
 - If ./check says STOP, write SUMMARY.json and end immediately.
 - Don't flail. If the score hasn't improved in a few checks, step back, re-read
   target.s, and change the structure (loop form, if/else vs ternary, variable
@@ -789,20 +820,46 @@ and, if you learned something general about this compiler, append one-line
 bullets to NOTES.md (e.g. "- u8 locals compared to constants emit lsl/lsr; use int").
 ```
 
-## Appendix B: `prompts/task.md.j2` (draft)
+## Appendix B: `prompts/task.md.j2` (context_version 4; inner code fences shown as ~~~)
 
 ```markdown
 # Task: match {{ symbol }} ({{ mode }}, {{ n_insns }} instructions, module {{ module }})
 
-Files:
-- target.s: the original assembly for {{ symbol }} (and its literal pool)
-- ctx.h: types, prototypes, constants
-- examples/: {{ examples|length }} similar functions with matching C
-{% if draft %}- draft.c: an automatic first draft (often wrong in details){% endif %}
-{% if previous_best %}- previous_best.c / previous_best.diff: best earlier attempt ({{ previous_best_score }}%){% endif %}
+This message already contains target.s, the declarations from ctx.h that this function
+needs, and LEARNINGS.md. You don't need to open those files.
+
+## target.s
+
+~~~
+{{ target_s }}
+~~~
+
+## Declarations you need (cut from ctx.h; line numbers refer to ctx.h)
+
+~~~c
+{{ declarations if declarations else "/* none found: grep ctx.h by name */" }}
+~~~
+
+## Other files
+
+- ctx.h: the full context ({{ ctx_kb }} KB). Grep it for specific names; never read it whole.
+- examples/: {{ examples|length }} similar functions with matching C{% if examples %} ({{ examples|join(", ") }}){% endif %}
+
+{% if draft %}
+- draft.c: an automatic first draft (often wrong in details)
+{% endif %}
+{% if previous_best %}
+- previous_best.c / previous_best.diff: best earlier attempt ({{ previous_best_score }}%)
+{% endif %}
+
+## LEARNINGS.md
+
+{{ learnings }}
 
 Budget: at most {{ max_checks }} runs of ./check. Stop early if you match.
-{% if version_cond %}This function is checked against every target version.{% endif %}
+{% if version_cond %}
+This function is checked against every target version.
+{% endif %}
 
 Write the function {{ symbol }} in candidate.c, run ./check, iterate to MATCH.
 ```

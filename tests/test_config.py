@@ -51,3 +51,10 @@ def test_api_key_is_secret() -> None:
         _env_file=None, target_repo=Path("/t"), target_pin="p", anthropic_api_key="sk-1"
     )
     assert "sk-1" not in repr(settings)
+
+
+def test_effort_by_size() -> None:
+    settings = Settings(_env_file=None, target_repo=Path("/t"), target_pin="p")
+    assert [settings.effort_for_size(b) for b in ("S", "M", "L")] == ["medium", "high", "high"]
+    off = Settings(_env_file=None, target_repo=Path("/t"), target_pin="p", effort_by_size="L:max")
+    assert off.effort_for_size("S") == "high" and off.effort_for_size("L") == "max"

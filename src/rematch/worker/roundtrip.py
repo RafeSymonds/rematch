@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict
 from rematch.session import Session
 from rematch.target.definition import target_dir
 from rematch.worker.sandbox import (
+    ContextError,
     FunctionRecord,
     SandboxError,
     SandboxOptions,
@@ -120,6 +121,8 @@ def roundtrip_one(s: Session, fn: FunctionRecord, sandbox: Path) -> Outcome:
     """Build a sandbox seeded with the human C and run the real ./check once."""
     try:
         build_sandbox(s, fn, sandbox, SandboxOptions(with_source=True))
+    except ContextError as exc:
+        return Outcome(fn.name, "context_error", 0.0, detail=[str(exc)])
     except SandboxError as exc:
         return Outcome(fn.name, "error", 0.0, detail=[str(exc)])
     seconds, data = _run_check(sandbox)

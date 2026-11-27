@@ -93,6 +93,10 @@ class AsmSection(_Section):
 
 class WorkerSection(_Section):
     intro: str = ""  # target sentence for the worker system prompt (Appendix A {{ target_intro }})
+    compiler: str = ""  # compiler family for shared learnings: docs/learnings/<compiler>.json
+    # Header (relative to .rematch/) that learnings evidence includes as "types.h": typedefs
+    # plus any pragmas the target's code always compiles under. Default: rematch's types.h.
+    trial_header: str = ""
 
 
 class ContextSection(_Section):

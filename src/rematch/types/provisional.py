@@ -93,12 +93,14 @@ def parse_block(body: str) -> list[ProvType]:
         for decl in _split_top(m.group("body")):
             if "{" in decl:
                 raise TypesError(f"{name}: nested struct/union members are not allowed")
-            f = _FIELD.match(decl)
-            if f is None:
-                raise TypesError(f"{name}: cannot read field {decl!r}")
-            if not FIELD_NAME.match(f.group("name")):
-                raise TypesError(f"{name}: field {f.group('name')!r} must be named unk_XX")
-            fields.append(ProvField(f.group("name"), decl, ":" in decl))
+            # The field name is the unk_XX identifier anywhere in the declarator, so function
+            # pointers and arrays of them work: `void (*unk_00[3])(void)`.
+            names = [w for w in re.findall(r"\b\w+\b", decl) if FIELD_NAME.match(w)]
+            if not names:
+                f = _FIELD.match(decl)
+                found = f.group("name") if f else decl
+                raise TypesError(f"{name}: field {found!r} must be named unk_XX")
+            fields.append(ProvField(names[0], decl, ":" in decl and "(" not in decl))
         if not fields:
             raise TypesError(f"{name} has no fields")
         types.append(ProvType(name, m.group("kind"), tuple(fields), stmt + ";"))

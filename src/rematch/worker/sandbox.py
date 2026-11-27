@@ -13,23 +13,28 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from rematch import prompts
+from rematch.context.declarations import declarations, read_tags
 from rematch.context.header_index import HeaderIndex
+from rematch.context.m2c import apply_prototype, m2c_asm, run_m2c
 from rematch.diff.match import function_view
 from rematch.diff.objdump_backend import Line, disassemble, run_objdump
 from rematch.inventory import asm_parser, link_order
 from rematch.inventory.c_parser import function_source, strip_comments, tu_local_context
+from rematch.learnings.rules import compiler_file, sandbox_text, target_file
 from rematch.session import Session
 from rematch.target.definition import target_dir
-from rematch.toolchain.compile_db import CompileDB
+from rematch.toolchain.compile_db import CompileDB, CompileEntry
 from rematch.toolchain.objects import ObjectFile, read_object
 from rematch.worker.check_entry import save_target
 from rematch.worker.task import CompileSpec, Task, VersionTask
 
-LEARNINGS = Path(__file__).resolve().parents[3] / "docs" / "LEARNINGS.md"
-
 
 class SandboxError(Exception):
     pass
+
+
+class ContextError(SandboxError):
+    """The target's context command failed for this function's headers."""
 
 
 @dataclass(frozen=True)
@@ -68,6 +73,16 @@ def find_function(conn: sqlite3.Connection, spec: str) -> FunctionRecord:
     return FunctionRecord(r[0], r[1], r[2], r[3], r[4], r[5], r[6], bool(r[7]))
 
 
+def load_functions(conn: sqlite3.Connection, ids: list[int]) -> list[FunctionRecord]:
+    cols = "id, name, address, module, tu_path, source_kind, mode, version_cond"
+    out = []
+    for fid in ids:
+        r = conn.execute(f"SELECT {cols} FROM functions WHERE id = ?", (fid,)).fetchone()
+        if r is not None:
+            out.append(FunctionRecord(r[0], r[1], r[2], r[3], r[4], r[5], r[6], bool(r[7])))
+    return out
+
+
 def _include_form(header: str, include_dirs: list[str]) -> str:
     for d in sorted(include_dirs, key=len, reverse=True):
         prefix = d.rstrip("/") + "/"
@@ -95,16 +110,45 @@ def context_stub(
     return "".join(f'#include "{h}"\n' for h in headers)
 
 
-def make_context(s: Session, version: str, stub: Path) -> str:
+def include_flags(entry: CompileEntry) -> list[str]:
+    """The compile entry's `-I` directories, absolute (they are relative to its build dir)."""
+    out: list[str] = []
+    argv = list(entry.argv)
+    for i, arg in enumerate(argv):
+        path = None
+        if arg == "-I" and i + 1 < len(argv):
+            path = argv[i + 1]
+        elif arg.startswith("-I") and len(arg) > 2:
+            path = arg[2:]
+        if path is not None:
+            out.append(f"-I{(entry.directory / path).resolve()}")
+    return out
+
+
+def make_context(s: Session, version: str, stub: Path, entry: CompileEntry) -> str:
+    """Run the target's context command. `{includes}` expands to the TU's own -I flags."""
     ctx = s.definition.require(s.definition.context, "context")
-    argv = [
-        a.format(target_dir=target_dir(s.settings.target_repo), version=version, input=stub)
-        for a in ctx.command
-    ]
+    argv: list[str] = []
+    for a in ctx.command:
+        if a == "{includes}":
+            argv += include_flags(entry)
+        else:
+            argv.append(
+                a.format(target_dir=target_dir(s.settings.target_repo), version=version, input=stub)
+            )
     result = s.runner.run(argv, cwd=s.worktree, timeout=120)
     if result.returncode != 0:
-        raise SandboxError(f"context command failed: {result.stderr.strip()[:500]}")
+        raise ContextError(f"context command failed: {result.stderr.strip()[:500]}")
     return result.stdout
+
+
+def asm_function_text(s: Session, fn: FunctionRecord, tu_text: str) -> str | None:
+    if fn.source_kind != "asm" or s.definition.asm is None:
+        return None
+    for f in asm_parser.PARSERS[s.definition.asm.format](tu_text):
+        if f.name == fn.name:
+            return f.text
+    return None
 
 
 def render_target(
@@ -120,9 +164,12 @@ def render_target(
     return "\n".join([f"; {fn.name} ({fn.mode}, {n} instructions)", *body]) + "\n"
 
 
-def check_script() -> str:
+def check_script(control: Path) -> str:
     rematch = Path(sys.executable).parent / "rematch"
-    return f'#!/bin/sh\nexec "{rematch}" cd --sandbox "$(cd "$(dirname "$0")" && pwd)" "$@"\n'
+    return (
+        f'#!/bin/sh\nexec "{rematch}" cd --sandbox "$(cd "$(dirname "$0")" && pwd)" '
+        f'--control "{control}" "$@"\n'
+    )
 
 
 @dataclass(frozen=True)
@@ -148,12 +195,41 @@ def _rename(text: str, old: str, new: str) -> str:
     return re.sub(rf"\b{re.escape(old)}\b", new, text)
 
 
-def _vanilla_lines(s: Session, obj_path: Path, name: str) -> tuple[ObjectFile, list[Line]]:
+def _vanilla_lines(
+    s: Session, obj_path: Path, name: str, asm_text: str | None = None
+) -> tuple[ObjectFile, list[Line]]:
+    """The target's normalized lines. For an assembly function, `asm_text` (its source) names
+    literal-pool words that point at labels local to the assembly file."""
     obj = read_object(obj_path)
-    lines = disassemble(run_objdump(s.settings.objdump, obj.path), obj).get(name)
+    text = run_objdump(s.settings.objdump, obj.path)
+    lines = disassemble(text, obj).get(name)
     if lines is None:
         raise SandboxError(f"{name} not found in {obj_path}")
+    names = asm_pool_names(asm_text, lines) if asm_text else {}
+    if names:
+        lines = disassemble(text, obj, pool_names={name: names})[name]
     return obj, lines
+
+
+_WORD = re.compile(r"^\s*(?:[\w.$]+:\s*)?\.word\s+([^;@]+?)\s*(?:[;@].*)?$")
+_SYMBOL_EXPR = re.compile(r"^([A-Za-z_.$][\w.$]*)\s*(?:([+-])\s*(0x[0-9a-fA-F]+|\d+))?$")
+
+
+def asm_pool_names(asm_text: str, lines: list[Line]) -> dict[int, str]:
+    """Offset -> name for the target's `.word` lines, from the source's `.word` operands in
+    order. Empty when the counts disagree (then anonymous targets compare by content)."""
+    exprs = [m.group(1) for m in map(_WORD.match, asm_text.splitlines()) if m]
+    words = [ln for ln in lines if ln.mnemonic == ".word"]
+    if len(exprs) != len(words):
+        return {}
+    out: dict[int, str] = {}
+    for ln, expr in zip(words, exprs, strict=True):
+        m = _SYMBOL_EXPR.match(expr.strip())
+        if m is None:
+            continue
+        addend = int(m.group(3), 0) * (-1 if m.group(2) == "-" else 1) if m.group(3) else 0
+        out[ln.offset] = m.group(1) + (f"{addend:+#x}" if addend else "")
+    return out
 
 
 def write_examples(s: Session, examples: tuple[FunctionRecord, ...], out: Path) -> list[str]:
@@ -181,17 +257,30 @@ def write_examples(s: Session, examples: tuple[FunctionRecord, ...], out: Path) 
 
 
 def build_sandbox(
-    s: Session, fn: FunctionRecord, out: Path, options: SandboxOptions | None = None
+    s: Session,
+    fn: FunctionRecord,
+    out: Path,
+    options: SandboxOptions | None = None,
+    control: Path | None = None,
 ) -> Task:
+    """Write the sandbox at `out` and its control data (task.json, .target/) at `control`.
+
+    Worker attempts keep the control directory outside the sandbox, under `REMATCH_VAR`, which
+    workers are denied reading; it names the real symbol in bench mode. Other callers default
+    to `out/.control`.
+    """
     opts = options or SandboxOptions()
     if out.exists() and any(out.iterdir()):
         raise SandboxError(f"{out} exists and is not empty")
+    control = (control or out / ".control").resolve()
+    control.mkdir(parents=True, exist_ok=True)
     if opts.bench and fn.source_kind != "c_human":
         raise SandboxError("bench mode needs a human-C target")
     out.mkdir(parents=True, exist_ok=True)
     build = s.definition.require(s.definition.build_info, "build")
     versions = s.target.versions() if fn.version_cond else [s.primary_version]
     tu_text = (s.worktree / fn.tu_path).read_text(encoding="utf-8", errors="replace")
+    asm_source = asm_function_text(s, fn, tu_text)
     symbol = anonymous_name(s, fn.module, fn.address) if opts.bench else fn.name
     index = (
         HeaderIndex.from_json(s.header_index_path.read_text(encoding="utf-8"))
@@ -206,15 +295,15 @@ def build_sandbox(
         db = CompileDB.load(build_dir / build.compile_commands, s.worktree)
         tu_entry = db.entry(fn.tu_path)
         entry = tu_entry if fn.source_kind == "c_human" else db.c_template_for(fn.tu_path)
-        obj, lines = _vanilla_lines(s, tu_entry.object_path, fn.name)
-        save_target(out, version, lines, function_view(obj, fn.name, lines, fn.name))
+        obj, lines = _vanilla_lines(s, tu_entry.object_path, fn.name, asm_source)
+        save_target(control, version, lines, function_view(obj, fn.name, lines, fn.name))
         if i == 0:
             primary_lines = lines
 
         callees = [ln.reloc for ln in lines if ln.reloc and not ln.reloc.startswith("<")]
         stub = out / f".ctx_stub.{version}.c"
         stub.write_text(context_stub(s, fn, tu_text, callees, index), encoding="utf-8")
-        ctx = make_context(s, version, stub)
+        ctx = make_context(s, version, stub, entry)
         stub.unlink()
         if fn.source_kind == "c_human":
             local = tu_local_context(tu_text, fn.name)
@@ -235,15 +324,43 @@ def build_sandbox(
         )
 
     asm_format = s.definition.asm.format if s.definition.asm else None
+    names = [  # relocation targets without their addends ("sTable+0x4" -> "sTable")
+        re.split(r"[+-]0x", ln.reloc)[0]
+        for ln in primary_lines
+        if ln.reloc and not ln.reloc.startswith("<")
+    ]
+    called = {
+        ln.reloc for ln in primary_lines if ln.reloc and ln.mnemonic.split(".")[0] in ("bl", "blx")
+    }
+    decls = declarations(
+        (out / "ctx.h").read_text(encoding="utf-8", errors="replace"),
+        read_tags(s.settings.ctags, out / "ctx.h"),
+        functions=[symbol, *dict.fromkeys(n for n in names if n in called)],
+        data=list(dict.fromkeys(n for n in names if n not in called)),
+    )
     shown = FunctionRecord(
         fn.id, symbol, fn.address, fn.module, fn.tu_path, fn.source_kind, fn.mode, fn.version_cond
     )
-    (out / "target.s").write_text(render_target(shown, primary_lines, tu_text, asm_format))
+    target_s = render_target(shown, primary_lines, tu_text, asm_format)
+    (out / "target.s").write_text(target_s)
+    draft = None
+    if s.settings.m2c and not opts.with_source:
+        draft = run_m2c(Path(s.settings.m2c), m2c_asm(symbol, primary_lines), None)
+        if draft is not None:
+            draft = f"// Automatic first draft (m2c); often wrong in details.\n{draft}"
+            (out / "draft.c").write_text(draft, encoding="utf-8")
     if opts.with_source:
         source = function_source(tu_text, fn.name)
         if source is None:
             raise SandboxError(f"no C source for {fn.name} in {fn.tu_path}")
         candidate = _rename(source, fn.name, symbol) + "\n"
+    elif draft is not None and (body := function_source(draft, symbol)) is not None:
+        # m2c's preamble guesses externs with `?` types; seed only the function itself, with
+        # the real prototype when ctx.h has one.
+        body = apply_prototype(body, symbol, decls)
+        candidate = (
+            f"// Starting point: m2c's draft (see draft.c). Fix it until ./check matches.\n{body}\n"
+        )
     else:
         candidate = f"// Write {symbol} here. Its prototype, if known, is in ctx.h.\n"
     (out / "candidate.c").write_text(candidate, encoding="utf-8")
@@ -252,11 +369,17 @@ def build_sandbox(
     # so the worker's report file exists from the start.
     (out / "SUMMARY.json").write_text("{}\n", encoding="utf-8")
     check = out / "check"
-    check.write_text(check_script(), encoding="utf-8")
+    check.write_text(check_script(control), encoding="utf-8")
     check.chmod(0o755)
 
     example_names = write_examples(s, opts.examples, out)
-    (out / "LEARNINGS.md").write_text(LEARNINGS.read_text(encoding="utf-8"), encoding="utf-8")
+    learnings = sandbox_text(
+        [
+            compiler_file(s.definition.worker.compiler or "default"),
+            target_file(target_dir(s.settings.target_repo)),
+        ]
+    )
+    (out / "LEARNINGS.md").write_text(learnings, encoding="utf-8")
     if opts.task_md:
         (out / "TASK.md").write_text(
             prompts.render(
@@ -266,11 +389,16 @@ def build_sandbox(
                 n_insns=sum(1 for ln in primary_lines if not ln.is_data),
                 module=fn.module,
                 examples=example_names,
-                draft=None,
+                draft=draft is not None,
                 previous_best=None,
                 previous_best_score=None,
                 max_checks=s.settings.max_checks,
                 version_cond=fn.version_cond,
+                asm_target=fn.source_kind == "asm",
+                target_s=target_s.rstrip("\n"),
+                declarations=decls,
+                ctx_kb=(out / "ctx.h").stat().st_size // 1024,
+                learnings=learnings.strip(),
             ),
             encoding="utf-8",
         )
@@ -288,7 +416,7 @@ def build_sandbox(
         objdump=s.settings.objdump,
         compile_timeout=s.settings.compile_timeout_sec,
     )
-    task.save(out)
+    task.save(control)
     return task
 
 

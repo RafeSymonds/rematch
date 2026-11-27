@@ -13,7 +13,7 @@ from __future__ import annotations
 import hashlib
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from rematch.toolchain.objects import ObjectFile, Reloc, Symbol
@@ -34,6 +34,7 @@ class Line:
     operands: str  # normalized
     is_data: bool = False
     reloc: str | None = None  # normalized relocation target at this line, if any
+    label: str | None = None  # `.L<k>` if a local branch targets this line (not part of `text`)
 
     @property
     def text(self) -> str:
@@ -75,7 +76,9 @@ def is_call(line: Line) -> bool:
 
 def run_objdump(objdump: str, path: Path, timeout: float = 60) -> str:
     result = subprocess.run(
-        [objdump, "-d", "-r", "--no-show-raw-insn", str(path)],
+        # -z: RELA objects hold zeros at every relocated literal-pool word, and objdump would
+        # otherwise collapse them into "..." and drop them from the listing.
+        [objdump, "-d", "-r", "-z", "--no-show-raw-insn", str(path)],
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -130,12 +133,17 @@ def content_key(obj: ObjectFile, sym: Symbol, addend: int) -> str:
 
 
 def disassemble(
-    objdump_text: str, obj: ObjectFile, self_names: dict[str, str] | None = None
+    objdump_text: str,
+    obj: ObjectFile,
+    self_names: dict[str, str] | None = None,
+    pool_names: dict[str, dict[int, str]] | None = None,
 ) -> dict[str, list[Line]]:
     """Split objdump output into normalized lines per function symbol.
 
     `self_names` maps a function name to the name its self-references should be treated as
-    (normally itself).
+    (normally itself). `pool_names` names literal-pool words (function -> offset -> name) whose
+    relocation is anonymous, e.g. a label local to an assembly file that the object does not
+    keep as a symbol.
     """
     funcs = {sym.name: sym for sym in obj.functions()}
     raw: dict[str, list[tuple[int, str, str]]] = {}
@@ -177,7 +185,8 @@ def disassemble(
             for r in section.relocs:
                 if sym.value <= r.offset < sym.value + sym.size:
                     by_off[r.offset - sym.value] = r
-        out[name] = _normalize(entries, by_off, obj, sym, self_name)
+        names = (pool_names or {}).get(name, {})
+        out[name] = _normalize(entries, by_off, obj, sym, self_name, names)
     return out
 
 
@@ -191,6 +200,7 @@ def _normalize(
     obj: ObjectFile,
     sym: Symbol,
     self_name: str,
+    pool_names: dict[int, str] | None = None,
 ) -> list[Line]:
     data = obj.sections[sym.section].data if sym.section is not None else b""
 
@@ -203,7 +213,10 @@ def _normalize(
             addend += 4  # Thumb BL encodes PC-relative; the -4 is not part of the target
         elif r.type in ("R_ARM_CALL", "R_ARM_JUMP24", "R_ARM_PC24"):
             addend += 8
-        return describe_target(obj, r.symbol, addend, self_name)
+        shown = describe_target(obj, r.symbol, addend, self_name)
+        if pool_names and off in pool_names and shown.startswith("<"):
+            return pool_names[off]
+        return shown
 
     # Branch labels: ordinal among distinct in-function targets.
     targets: set[int] = set()
@@ -255,4 +268,4 @@ def _normalize(
             lines.append(Line(off, mn, f"{dest}, ={pool_value}", reloc=reloc))
             continue
         lines.append(Line(off, mn, clean, reloc=reloc))
-    return lines
+    return [replace(ln, label=labels[ln.offset]) if ln.offset in labels else ln for ln in lines]

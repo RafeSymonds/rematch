@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from elftools.elf.descriptions import describe_reloc_type
@@ -81,13 +81,31 @@ class ObjectFile:
     symbols: list[Symbol]
 
     def functions(self) -> list[Symbol]:
-        """Sized function symbols, excluding mapping symbols, in (section, offset) order."""
+        """Sized function symbols, excluding mapping symbols, in (section, offset) order.
+
+        Trailing alignment padding is not part of a function: assembly sources often end a
+        function with `.balign 4, 0` before setting its size, which a compiler never does.
+        Two zero bytes at the end, marked as data (`$d`), are dropped from the size.
+        """
         funcs = [
-            s
+            self._without_padding(s)
             for s in self.symbols
             if s.type == "FUNC" and s.size > 0 and not s.is_mapping and s.section is not None
         ]
         return sorted(funcs, key=lambda s: (s.section or 0, s.value))
+
+    def _without_padding(self, sym: Symbol) -> Symbol:
+        section = self.sections.get(sym.section) if sym.section is not None else None
+        end = sym.value + sym.size
+        if section is None or section.nobits or sym.size % 4 or sym.size < 4:
+            return sym
+        if section.data[end - 2 : end] != b"\0\0":
+            return sym
+        if not any(
+            m.name == "$d" and m.section == sym.section and m.value == end - 2 for m in self.symbols
+        ):
+            return sym
+        return replace(sym, size=sym.size - 2)
 
     def function(self, name: str) -> Symbol | None:
         for sym in self.functions():

@@ -44,7 +44,11 @@ def _score(entry: dict[str, object]) -> float:
 
 
 def classify(
-    sandbox: Path, manifest: dict[str, str], invoke: InvokeResult, task: Task
+    sandbox: Path,
+    manifest: dict[str, str],
+    invoke: InvokeResult,
+    task: Task,
+    control: Path | None = None,
 ) -> Classified:
     tampered = verify_seal(sandbox, manifest)
     if tampered:
@@ -63,7 +67,9 @@ def classify(
         source = (sandbox / HISTORY / f"{c.best_check:03d}.c").read_text(encoding="utf-8")
         c.best_source = source
         # Re-verify the best candidate ourselves; the history JSON is worker-writable.
-        rejected, errors, results = evaluate(sandbox, task, source, sandbox / HISTORY / "verify")
+        rejected, errors, results = evaluate(
+            sandbox, task, source, sandbox / HISTORY / "verify", control
+        )
         if rejected is None and not errors and results and all(r.match for r in results):
             c.outcome = "match"
             c.verified_versions = [r.version for r in results]

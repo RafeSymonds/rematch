@@ -104,6 +104,7 @@ def _record_match(
     source: str,
     sandbox: Path,
     versions: list[str],
+    model: str = "recheck",
 ) -> int:
     stamp = now()
     with conn:
@@ -111,9 +112,9 @@ def _record_match(
             "INSERT INTO attempts (run_id, function_id, task_kind, model, effort, started_at,"
             " ended_at, outcome, checks_used, best_score, final_score, num_turns, cost_usd,"
             " sandbox_path, best_candidate_path)"
-            " VALUES (?, ?, 'function', 'recheck', 'none', ?, ?, 'match', 1, 100, 100, 0, 0,"
+            " VALUES (?, ?, 'function', ?, 'none', ?, ?, 'match', 1, 100, 100, 0, 0,"
             " ?, ?)",
-            (run_id, fn_id, stamp, stamp, str(sandbox), str(sandbox / "candidate.c")),
+            (run_id, fn_id, model, stamp, stamp, str(sandbox), str(sandbox / "candidate.c")),
         )
         attempt_id = int(cur.lastrowid or 0)
         conn.execute(

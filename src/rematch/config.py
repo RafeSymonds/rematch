@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     push_remote: str = ""
     # Integrate a run of matched functions only if it has this many, or it completes the TU.
     integrate_min_run: int = Field(default=3, ge=1)
+    # Threads that prepare TU steps (piece checks, tu_fix/tu_data agents) while one lands.
+    integrate_workers: int = Field(default=4, ge=1)
     # Live loop (SPEC §8): wait before retrying a failed function on the next ladder rung.
     retry_cooldown_sec: float = Field(default=600, ge=0)
 
@@ -62,6 +64,8 @@ class Settings(BaseSettings):
     ctags: str = "ctags"
     bench_cutoff_date: str = "2026-07-01"
     compile_timeout_sec: float = Field(default=20, gt=0)
+    # Piece checks compile whole C pieces, often while workers load the machine (SPEC §10).
+    piece_compile_timeout_sec: float = Field(default=120, gt=0)
     log_level: str = "info"
 
     @field_validator("rematch_db", "live_worktree", mode="before")

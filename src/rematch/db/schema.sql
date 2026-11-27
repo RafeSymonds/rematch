@@ -137,7 +137,7 @@ CREATE TABLE integrations (
   commit_sha     TEXT,
   detail         TEXT,
   created_at     TEXT NOT NULL
-);
+, plan_hash TEXT);
 CREATE INDEX integrations_tu ON integrations (tu_path, id);
 CREATE TABLE piece_sources (
   id             INTEGER PRIMARY KEY,
@@ -146,5 +146,5 @@ CREATE TABLE piece_sources (
   source         TEXT NOT NULL,
   attempt_id     INTEGER REFERENCES attempts(id),
   created_at     TEXT NOT NULL
-);
+, kind TEXT NOT NULL DEFAULT 'functions');
 CREATE INDEX piece_sources_tu ON piece_sources (tu_path, functions_json);

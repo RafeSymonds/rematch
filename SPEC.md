@@ -96,6 +96,7 @@ address_version = "us"                     # version whose addresses the assembl
 intro = "The target is ... compiled with ..., Thumb mode unless target.s says otherwise."   # Appendix A {{ target_intro }}
 compiler = "mwcc-arm"        # compiler family: shares docs/learnings/<compiler>.json with other targets (§13.1)
 trial_header = "trial.h"     # optional, in .rematch/: the evidence header (typedefs + mode pragmas)
+mode_wrap = { arm = ["#pragma thumb off", "#pragma thumb on"] }   # optional: lines the harness puts around a function of that ISA mode (check and pieces); workers may not write #pragma
 ```
 
 ### 2.1.3 Phase 4 fields
@@ -144,7 +145,8 @@ rematch/
     session.py                   # settings + target + vanilla worktree for target commands
     worker/sandbox.py  worker/task.py  worker/check_entry.py  worker/roundtrip.py  worker/invoke.py  worker/outcome.py
     orchestrator/scheduler.py  orchestrator/leases.py  orchestrator/escalation.py  orchestrator/run.py
-    integrate/tu_builder.py  integrate/lsf.py  integrate/verify.py
+    integrate/run.py  integrate/pret_asm.py  integrate/compose.py  integrate/piece.py  integrate/linkspec.py
+    integrate/tu_fix.py  integrate/labels.py  integrate/data_check.py  integrate/tu_data.py  integrate/publish.py   # §10
     bench/pool.py  bench/sets.py  bench/report.py
     lint/readability.py
     learnings/curate.py  learnings/rules.py  learnings/trial.py  learnings/curate_run.py   # §13.1
@@ -154,7 +156,7 @@ rematch/
   prompts/
     worker_system.md             # Appendix A (versioned: header line `prompt_version: N`)
     task.md.j2                   # Appendix B
-    tu_data_task.md.j2
+    tu_fix.md  tu_data.md          # §10 task prompts
     curate.md  curate/types.h    # §13.1 curation agent and its default evidence header
   docs/
     learnings/<compiler>.json    # compiler-scope rules (§13.1); .md alongside is generated
@@ -182,6 +184,7 @@ This repo is target-agnostic: no game names, target paths, host names or persona
 | `REMATCH_VAR` | `./var` | DB, logs, bench sets |
 | `REMATCH_WORKDIR` | `~/.rematch/work` | Sandboxes. **Must be outside any repo**: no `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md` or `.claude/` in it or any ancestor (§7.1). The one exemption is Claude Code's user config dir (`$CLAUDE_CONFIG_DIR`, default `~/.claude`), which exists on every host and whose leakage is handled by §7.3. `rematch doctor` enforces this. |
 | `LIVE_WORKTREE` | (empty) | Worktree of `TARGET_REPO` on branch `rematch/live`, where integration commits (§10). Required by `integrate`, `run` and `publish`. |
+| `INTEGRATE_WORKERS` | `4` | Threads that prepare TU steps (piece checks, `tu_fix`/`type_merge`/`tu_data` attempts) while prepared batches land one at a time (§10) |
 | `MERGE_BRANCH` | (empty) | Branch of the target that `publish` and the end of `run` merge `rematch/live` into (§10.1). Empty: never merge. |
 | `PUSH_REMOTE` | (empty) | Remote that `MERGE_BRANCH` is pushed to after a publish. Empty: never push. |
 | `WORKER_COUNT` | `4` | Concurrent attempts |
@@ -208,6 +211,7 @@ This repo is target-agnostic: no game names, target paths, host names or persona
 | `CTAGS` | `ctags` | Universal Ctags, used by the header index (§6.3) |
 | `BENCH_CUTOFF_DATE` | `2026-07-01` | Contamination cutoff (§11.1) |
 | `COMPILE_TIMEOUT_SEC` | `20` | |
+| `PIECE_COMPILE_TIMEOUT_SEC` | `120` | Compiles of whole C pieces by the integrator and `tu-check`, which often run while workers load the machine (§10) |
 | `LOG_LEVEL` | `info` | |
 
 ---
@@ -347,7 +351,7 @@ CREATE TABLE name_proposals (                -- naming pass (§16.5); applied on
 );
 ```
 
-Migrations are forward-only SQL files in `db/migrations/NNNN_*.sql`, applied in order at startup. The number of the last applied migration is stored in `PRAGMA user_version`. `db/schema.sql` is the schema that applying every migration produces, and a test enforces that.
+Migrations are forward-only SQL files in `db/migrations/NNNN_*.sql`, applied in order at startup. The number of the last applied migration is stored in `PRAGMA user_version`. `db/schema.sql` is the schema that applying every migration produces, and a test enforces that. Phase 4 adds `integrations` (one row per TU step, committed or failed, with `plan_hash`, a hash of the step's inputs) and `piece_sources` (C pieces stored by `tu_fix`, `kind = 'functions'`, or `tu_data`, `kind = 'data'`); their columns are in `schema.sql`.
 
 ---
 
@@ -406,7 +410,7 @@ For each function, produce a sandbox `ctx.h`:
 Invocation inside a sandbox: `./check` (no arguments). It runs `rematch cd --sandbox <dir>` and prints the text rendering (§6.6). `cd` reads only the sandbox: `task.json` records the compile argv per version, the toolchain prefix, the disassembler and the limits, so `./check` needs no `.env`. Exit codes: 0 `MATCH`, 1 no match (including compile errors and rejections), 3 `STOP`.
 
 Steps:
-1. Read `candidate.c`. Reject immediately (status `rejected`, no compile; this counts as a check) if it contains (outside comments and string literals): `asm`, `__asm`, any `#pragma`, an `#include` of anything except `"ctx.h"`, no definition of the target function, or more than one. From Phase 2, also reject a provisional-types block (§16.1) that is not at the top, appears twice, contains anything but type declarations, or redefines a name ctx.h declares.
+1. Read `candidate.c`. Reject immediately (status `rejected`, no compile; this counts as a check) if it contains (outside comments and string literals): `asm`, `__asm`, any `#pragma`, an `#include` of anything except `"ctx.h"`, no definition of the target function, or more than one. From Phase 2, also reject a provisional-types block (§16.1) that is not at the top (only `#include "ctx.h"` lines and comments may precede it), appears twice, contains anything but type declarations, or redefines a name ctx.h declares.
 2. Write scratch TU `scratch.<version>.c` = `#include "<ctx>"\n#line 1 "candidate.c"\n` + candidate, with the candidate's own `#include "ctx.h"` lines (allowed, and common) blanked in place, since the scratch file already includes the context. If the candidate defines the target `static`, append `void *const rematch_keep_<symbol> = (void *)<symbol>;`: nothing references the function in isolation, so the compiler would not emit it. The worker never sees this line.
 3. **Isolated mode (default):** compile the scratch TU with the exact argv from the vanilla build's `compile_commands.json` entry for the TU (for an assembly TU: the first C entry with the same output directory), with only the source and output swapped, cwd = the entry's `directory`, through `TOOLCHAIN_EXEC`. Timeout `COMPILE_TIMEOUT_SEC`.
    - Context for a human-C target (bench, round-trip) = the flattened headers of the TU's `#include` lines, plus the TU's own declarations: its text without `#include` lines and without the target's definition, with `inline` bodies kept and every other body turned into a prototype. Other functions' `static` prototypes lose `static`, because mwcc rejects a call to a static function it never sees defined.
@@ -427,6 +431,7 @@ Steps:
   - anonymous targets (string literals such as `@123`, section-relative references): the referenced bytes (strings shown as text, other data as length and hash, `.bss` as size). Isolation changes their offsets and numbering, not their contents.
   - function-scope statics (mwcc `name$NNNN`, the counter depends on the whole TU): name stem plus content.
   - a call the assembler resolved without a relocation (callee in the same section, common in assembly TUs) counts as a call to that callee.
+  - in an assembly target, a relocation to a label local to the assembly file (the assembler keeps no symbol, so it reads as section+offset) is named after that label. The labels come from a copy of the TU with every label made `.global`, assembled once with the TU's own argv and cached (`integrate/labels.py`). Pairing the source's `.word` operands by count is the fallback; it fails on jump tables, which objdump shows as `.word` pairs of `.short`s.
 Relocations are read as RELA; REL implicit addends are decoded from the patched bytes.
 
 **Score (0–100)** for partial credit: align the normalized instruction sequences (Levenshtein). Cost per aligned pair: exact 0, same mnemonic with different operands 0.5, different mnemonic 1, insertion or deletion 1. `score = 100 × (1 − cost / max(len_target, len_candidate))`. A score of 100 without a binary match (for example a pool or relocation mismatch) displays as `99.9`.
@@ -590,12 +595,12 @@ Phase 4a: `rematch run` orders work by TU instead, so matches form runs the inte
 
 ### 8.4 Escalation ladder
 
-Each failed attempt moves to the next rung of `ESCALATION_LADDER` (model:effort). Rung-specific changes:
+Each failed attempt moves to the next rung of `ESCALATION_LADDER` (model:effort). Every attempt records its rung in `attempts.escalation`. Rung-specific changes:
 - rung ≥ 1: include the previous best candidate and its diff in the sandbox as `previous_best.c` / `previous_best.diff`
 - rung ≥ 2: TU-context compile mode if available
 - rung ≥ 3: double `EXAMPLES_K`, and include an m2c draft if not already present
 
-After the last rung, the function becomes `stuck` and goes into the human review queue (`rematch stuck --list`).
+After the last rung, the function becomes `stuck` and goes into the human review queue. `rematch stuck [--module M] [--hint H]` lists failed and stuck functions with attempts, best score, cost, the hint categories at the best check of the best attempt (from its sandbox's `.history/`) and the worker's `open_issues`; `--show FN` prints one with its best candidate. `--accept FN --source F.c` checks a human's C exactly like a worker's candidate and, on a match, records it (attempt model `human`) and queues a learnings candidate about the difference.
 
 A failed function is retried on the next rung after `RETRY_COOLDOWN_SEC` (default 600). Leases are held as `host:pid`. On start, and at every queue refresh, expired leases and leases of dead processes on this host revert to `untried` (no attempt yet) or `failed`. Ctrl-C stops new launches and lets running attempts finish. Every `--integrate-every` matches (default 10), `integrate` runs on ready TUs in a background thread.
 
@@ -611,7 +616,7 @@ A match is accepted only if `lint/readability.py` passes:
 - identifiers: unknown struct fields as `unk_XX` (hex offset), unknown locals as descriptive or `var0..`; never invent "meaningful" names for things not evidenced (callee names, string contents, or constants are evidence)
 - clang-format clean using the target repo's `.clang-format`, if it has one
 - provisional types follow §16.1 (names, `unk_XX` fields, no redefinition of ctx.h names)
-- (Phase 4) no raw pointer math into an object that has a type: once a shared or provisional type describes the pointee, `*(T *)((u8 *)p + N)`, `((u8 *)p)[N]` and similar fail the lint. Use the field.
+- (Phase 4b) pointer math into an object that has a type: `*(T *)((u8 *)p + N)`, `((u8 *)p)[N]` and similar, where `p` is declared as a pointer to a struct type, are **flagged** (`LINT_VERSION` 2). It becomes a failure once the rule can check that the struct has a field at that offset. `integrate` re-lints matches stored under an older `LINT_VERSION` before planning.
 
 Lint results are stored in `matches.lint_json` (`fail` and `flag` lists). A match with any `fail` stays `matched` but is not integrated. `goto`, `volatile` and cast chains are flags for review. `rematch lint` re-runs the lints over every stored match. Phase 4a implements the deterministic rules: inline asm, `#pragma`, extra `#include`, `do { } while (0)`, self-assignment, `goto`, `volatile`, cast chains. Unused locals are left to the compiler's warnings, and formatting is left to the target's own tooling.
 
@@ -626,8 +631,21 @@ Runs only in `LIVE_WORKTREE` (a worktree of the target on branch `rematch/live`)
 3. **Declare symbols across pieces.** A label defined in one piece and used in another (or by a C piece, read from its object's undefined symbols) gets `.global` where it is defined and `.public` where it is used. C pieces refer to data in the assembly by the label names target.s uses (§7.1: workers declare that data `extern`).
 4. **Compose each C piece.** The piece starts with the TU template's `#include`s, then every candidate's provisional types (address-unique names, rematch markers removed), then one prototype per function taken from its definition (replacing the candidates' own prototypes of siblings), then the candidates in address order with `#include "ctx.h"` removed and repeated top-level declarations kept once. A source stored by `tu_fix` for exactly these functions takes the place of the composed one.
 5. **Piece check, before anything is written.** Compile each C piece per version with the TU's C template entry. Every function must binary-match its vanilla original (with assembly pool names, §6.5). The object must emit exactly the piece's functions, no data sections, and the original layout: mwcc gives every function its own `.text` section, and offsets follow linker placement. On failure, `integrate --fix` runs a `tu_fix` attempt (sandbox: the piece as candidate.c, each function's assembly, a grep-only ctx.h, and `./check` = this piece check). A passing source goes to `piece_sources`.
-6. **Write and build.** Write the pieces, `git rm` any piece that disappeared, and edit the link-order source file (target.toml `[link_order] file`, never generated files). Build every version in the live worktree and check every ROM hash.
-7. **Commit or restore.** On pass, commit `rematch: <tu> to C (N functions, M in C)`, set `integrated`, fill `matches.integrated_commit`, and record the TU's pieces in `integrations`. On fail, reset the worktree and record why.
+6. **Skip repeats.** A TU whose last `integrations` row is a failure with the same `plan_hash` (functions in C, their sources, stored piece sources, current pieces) is skipped until an input changes. This also stops `tu_fix` from being retried on an unchanged failure.
+7. **Write and build, in batches.** Steps 1–6 run for every ready TU on `INTEGRATE_WORKERS` threads, writing nothing; a batch lands as soon as enough TUs are prepared. The prepared steps then land in batches (8 to start, doubling after a pass up to 32, halving after a failure): write every piece, `git rm` pieces that disappeared, edit the link-order source file (target.toml `[link_order] file`, never generated files), and build every version once, stopping at the first failure. Written paths are journaled in `REMATCH_VAR/integrate.journal`, and the next `integrate` undoes a batch a killed process left behind.
+8. **Commit or restore.** On pass, commit the batch (`rematch: <tu> to C (N functions, M in C)` for one TU, `rematch: integrate N TUs (M functions)` with the TUs in the body otherwise), set `integrated`, fill `matches.integrated_commit`, and record one `integrations` row per TU with the batch's commit. On fail, reset the worktree. If the build output names a piece file of exactly one TU, that TU is recorded as failed and the rest is retried. Otherwise the batch is split in halves, and each half is built on top of the commits before it, so every commit is a tree that was built.
+
+**ISA mode.** A function whose mode differs from the one the target's headers set (target.toml `[worker] mode_wrap`) is wrapped in the configured lines, both in the worker's check (around `candidate.c`) and in a composed piece (around that function).
+
+**Types (`integrate --types`, §16.2).** In a fully converted TU, each C piece with two or more provisional typedefs gets a `type_merge` attempt (sandbox as for `tu_fix`; ./check is the piece check plus the typedef count). The agent merges typedefs that describe the same object into one TU-local typedef, keeping an existing name and every field's offset and width. A source whose functions all still match and that has fewer provisional typedefs is stored (`piece_sources`, kind `types`) and lands through the batch flow. This runs before the data step, while the pieces are still the function pieces.
+
+**Data (`tu_data`, `integrate --data`).** A TU whose functions are all integrated and whose pieces are exactly one data-only assembly piece and one C file gets a `tu_data` step: one C file that defines the functions and the data replaces both. The check (`integrate/data_check.py`) compiles the file per version and compares it against the vanilla assembly object of the TU:
+- every function as in step 5, at its original offset;
+- each data section type (`.data`, `.rodata`, `.bss`, …) as the linker would concatenate the object's sections of that name, each aligned: total size, the alignment of the first section, the bytes with relocation sites zeroed, and the relocations;
+- references into data, from functions or from data, by location (section type and offset), never by name, so a label may become a static or a string literal, and two same-size objects that trade places fail;
+- labels the vanilla TU declares `.global`/`.public` (used by other files) must be global symbols with the same name and location;
+- no COMMON symbols, and no allocated sections other than code and data.
+The `tu_data` agent (sandbox: the C file as candidate.c, `data.s`, each function's assembly, a grep-only ctx.h, `./check` = this check, which prints a layout table of target labels against candidate symbols) stores a passing source in `piece_sources` with kind `data`. The step then lands through the batch flow: write the C file, `git rm` the assembly piece, and replace both lines in the link-order file with the C file's.
 
 `rematch recheck --run ID` re-verifies a live run's misses with the current checker and records the ones that now match (no tokens). `rematch status` shows function states, the integrated share of assembly instructions, and recent integrations.
 
@@ -669,7 +687,7 @@ Data conversion (`tu_data`, moving a TU's data sections into C) and shared types
 
 ### 11.3 Metrics (`rematch report`)
 
-Per run, overall and per size bucket: match rate; first-check compile rate; median checks to match; median turns; mean input, output and cache tokens per attempt and per match; cost per match (estimate); wall time per attempt; outcome distribution; lint-failure rate; escalation rung at match. `rematch bench` appends a summary row to the **target's** `.rematch/benchmarks.md` (format in CONTRIBUTING.md). Rows name the target, and this repo stays target-agnostic.
+Per run, overall and per size bucket: match rate; first-check compile rate; median checks to match; median turns; mean input, output and cache tokens per attempt and per match; cost per match (estimate); wall time per attempt; outcome distribution; lint-failure rate; escalation rung at match. Live runs add one row per ladder rung (`attempts.escalation`): attempts, match rate, cost per match. `rematch bench` appends a summary row to the **target's** `.rematch/benchmarks.md` (format in CONTRIBUTING.md). Rows name the target, and this repo stays target-agnostic.
 
 ---
 
@@ -690,11 +708,12 @@ rematch ctx FUNCTION --out DIR [--with-source]   # build a sandbox without a wor
 rematch roundtrip [--n N --seed S | --golden]    # human C through ./check must match (Phase 1 exit; .rematch/golden.toml)
 rematch attempt FUNCTION [--model M --effort E] --yes          # one live attempt
 rematch bench --n N --seed S [--pool clean|contaminated] [--workers W] [--model M --effort E] --yes
-rematch run --workers W [--max-attempts K] [--until HH:MM] [--no-publish]   # live loop, then publish (§10.1)
+rematch run --workers W [--max-attempts K] [--until HH:MM] [--finish] [--no-publish]   # live loop; --finish adds the types and data steps; then publish (§10.1)
 rematch publish [--branch B] [--remote R] [--dry-run]          # merge rematch/live into MERGE_BRANCH, push to PUSH_REMOTE
-rematch integrate [--tu TU | --ready | --verify-branch]        # --verify-branch: rebuild every rematch/live commit, check hashes
+rematch integrate [--tu TU | --ready | --types | --data | --verify-branch [--since SHA]] [--fix --yes]   # --types: merge provisional types; --data: tu_data step; --verify-branch: rebuild each rematch/live commit after the last verified one (REMATCH_VAR/verified), check hashes
+rematch types merge [--module M] [--layout]      # dry run: module-scoped clusters of provisional types and the evidence (§16.2)
 rematch report [--run ID | --last] [--compare ID]
-rematch stuck --list | --show FUNCTION
+rematch stuck [--module M] [--hint H] [--show FN | --accept FN --source F.c]
 rematch learnings review            # human accept/reject of candidates (rules without evidence)
 rematch learnings curate --yes      # agent curation; rematch verifies evidence before applying (§13.1)
 rematch learnings verify [--retire] # re-run every rule's evidence (no tokens)
@@ -757,7 +776,7 @@ Workers match one function at a time, but most unmatched functions use structs t
 
 ### 16.1 Provisional types (Phase 2)
 
-- A worker that needs a type ctx.h lacks declares it in one block at the top of `candidate.c`, between `/* rematch:types */` and `/* rematch:end-types */` (prompt rule, Appendix A). The block holds only struct, union, enum and typedef declarations.
+- A worker that needs a type ctx.h lacks declares it in one block at the top of `candidate.c` (after `#include "ctx.h"`, if the candidate has that line), between `/* rematch:types */` and `/* rematch:end-types */` (prompt rule, Appendix A). The block holds only struct, union, enum and typedef declarations.
 - Names: `UnkStruct_<ADDR>` (or `UnkUnion_<ADDR>`), where `<ADDR>` is the target function's address in 8 hex digits, with `_1`, `_2` suffixes for several. Fields are `unk_XX` by hex offset, optionally with a suffix for bitfields or split fields (`unk_58_0`). Gaps are `u8 unk_XX[N]` padding. The block may not redefine a name ctx.h declares (pre-filter, §6.4).
 - Offsets and sizes are measured, not parsed: on a match, `cd` compiles a probe that stores `sizeof` and every field's `offsetof` and size in a data object, and reads the values back from the object. The names are only a convention, and the compiler is the authority on layout.
 - On `match`, the block's types are stored in `provisional_types` with their measured layout and a canonical signature (`offset:size,...`). The block stays in `matches.c_source`.
@@ -765,6 +784,8 @@ Workers match one function at a time, but most unmatched functions use structs t
 ### 16.2 `type_merge` (Phase 4)
 
 A task kind that turns provisional types into shared ones.
+
+**Phase 4b result.** The mechanical design below was measured first: `rematch types merge` clusters provisional types per module from call, prototype, extern and pointer-field evidence, on the fields each body uses (padding arrays are measured as fields, so declared layouts would conflict almost always), with exact sizes for size-dependent types. On the first target only 16% of 1,853 provisional types had an evidence-backed partner, and about 700 candidate merges conflicted because workers modelled the same bytes differently (array vs scalar, embedded struct vs scalar). So Phase 4b merges types per fully converted TU with an agent instead (§10, types step), gated by the piece check; the clustering stays as a diagnostic. The steps below remain the design for cross-TU shared types.
 
 1. **Cluster** provisional types (and already accepted shared types) that are likely the same type. Hard constraints: equal size where both are known, and no conflicting (offset, size) pairs. Evidence that raises the score: many overlapping fields; the same pointer passed between functions (a match passes its typed pointer to a callee whose own match declares a type for that parameter); the same allocation size constant (`sizeof` equals the size passed to the allocator at the creation site); the same TU. `--tu TU` restricts a run to one TU, for TU-local types before integration (§10).
 2. **Propose**: an agent receives the cluster (definitions, the code that accesses each field, the evidence) and writes one definition, the union of known fields with `unk_XX` names. It may widen padding into fields but not change a field's measured offset or size.

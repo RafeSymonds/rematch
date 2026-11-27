@@ -22,6 +22,7 @@ class Symbol:
     type: str  # FUNC, OBJECT, NOTYPE, SECTION, FILE
     bind: str  # LOCAL, GLOBAL, WEAK
     section: int | None  # section index, None for undefined/absolute/common
+    common: bool = False  # SHN_COMMON: tentative definition the linker places
 
     @property
     def is_mapping(self) -> bool:
@@ -73,6 +74,12 @@ class Section:
     relocs: list[Reloc] = field(default_factory=list)
     nobits: bool = False
     align: int = 1
+    flags: int = 0  # sh_flags
+    size: int = 0  # sh_size (the only size a NOBITS section has)
+
+    @property
+    def alloc(self) -> bool:
+        return bool(self.flags & 0x2)  # SHF_ALLOC: occupies memory in the linked image
 
 
 @dataclass
@@ -155,6 +162,8 @@ def read_object(path: Path) -> ObjectFile:
                 data=data,
                 nobits=nobits,
                 align=max(1, int(esec["sh_addralign"])),
+                flags=int(esec["sh_flags"]),
+                size=int(esec["sh_size"]),
             )
 
         symbols: list[Symbol] = []
@@ -170,6 +179,7 @@ def read_object(path: Path) -> ObjectFile:
                         type=esym["st_info"]["type"].removeprefix("STT_"),
                         bind=esym["st_info"]["bind"].removeprefix("STB_"),
                         section=shndx if isinstance(shndx, int) else None,
+                        common=shndx == "SHN_COMMON",
                     )
                 )
 

@@ -46,8 +46,13 @@ def definition_header(name: str, source: str) -> str | None:
     return " ".join(m.group(1).split()) if m else None
 
 
-def compose_piece(includes: list[str], sources: list[tuple[str, str]]) -> str:
+def compose_piece(
+    includes: list[str],
+    sources: list[tuple[str, str]],
+    wraps: dict[str, tuple[str, str]] | None = None,
+) -> str:
     """`includes`: header names. `sources`: (function name, candidate) in address order.
+    `wraps`: function -> (prologue, epilogue) lines for its ISA mode (target.toml mode_wrap).
 
     Prototypes of functions defined in the piece are replaced by one prototype per function,
     taken from its definition, so candidates that guessed a sibling's signature agree.
@@ -68,7 +73,7 @@ def compose_piece(includes: list[str], sources: list[tuple[str, str]]) -> str:
     protos = [h for name, src in stripped if (h := definition_header(name, src))]
     if protos:
         parts += ["", *(f"{h};" for h in protos)]
-    for _name, source in stripped:
+    for name, source in stripped:
         body: list[str] = []
         for line, decl in _top_level_lines(source):
             if _CTX_INCLUDE.match(line):
@@ -81,5 +86,8 @@ def compose_piece(includes: list[str], sources: list[tuple[str, str]]) -> str:
                     continue
                 seen.add(key)
             body.append(line)
-        parts += ["", re.sub(r"\n{3,}", "\n\n", "\n".join(body)).strip("\n")]
+        text = re.sub(r"\n{3,}", "\n\n", "\n".join(body)).strip("\n")
+        if wraps and name in wraps:
+            text = f"{wraps[name][0]}\n{text}\n{wraps[name][1]}"
+        parts += ["", text]
     return "\n".join(parts).rstrip("\n") + "\n"

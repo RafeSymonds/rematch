@@ -8,6 +8,7 @@ lines and view per version (saved like a function sandbox's target cache).
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -20,6 +21,14 @@ from rematch.toolchain.objects import ObjectFile, read_object
 from rematch.toolchain.runner import ToolchainRunner
 from rematch.worker.check_entry import load_target, save_target
 from rematch.worker.task import CompileSpec
+
+_PROV_TYPEDEF = re.compile(r"\}\s*Unk(?:Struct|Union)_[0-9A-F]{8}(?:_\d+)?\s*;")
+
+
+def provisional_count(source: str) -> int:
+    """Provisional typedef definitions in a C file."""
+    return len(_PROV_TYPEDEF.findall(source))
+
 
 DATA_SECTIONS = (".data", ".rodata", ".bss", ".sdata", ".sbss", ".init", ".ctor", ".sinit")
 PIECE_FILE = "piece.json"
@@ -37,6 +46,8 @@ class PieceSpec:
     objdump: str
     timeout: float
     max_checks: int = 40
+    # types step: the piece passes only with fewer provisional typedefs than this (SPEC §16.2)
+    types_below: int | None = None
 
     def save(self, control: Path) -> None:
         control.mkdir(parents=True, exist_ok=True)

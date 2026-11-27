@@ -11,6 +11,7 @@ BEGIN = "/* rematch:types */"
 END = "/* rematch:end-types */"
 _BLOCK = re.compile(r"/\*\s*rematch:types\s*\*/(?P<body>.*?)/\*\s*rematch:end-types\s*\*/", re.S)
 _BEGIN_ANY = re.compile(r"/\*\s*rematch:types\s*\*/")
+_CTX_INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"ctx\.h"[ \t]*$', re.MULTILINE)
 TYPE_NAME = re.compile(r"^Unk(?:Struct|Union)_[0-9A-F]{8}(?:_\d+)?$")
 # unk_XX by hex offset, optionally with a suffix for bitfields or split fields (unk_58_0).
 FIELD_NAME = re.compile(r"^unk_[0-9A-Fa-f]+(?:_[0-9A-Za-z]+)?$")
@@ -70,9 +71,13 @@ def extract_block(candidate: str) -> str | None:
     m = _BLOCK.search(candidate)
     if m is None:
         raise TypesError("rematch:types block has no rematch:end-types")
-    before = strip_comments(candidate[: m.start()]).strip()
+    # Only the candidate's own `#include "ctx.h"` may precede the block (the scratch TU
+    # includes the context itself, so that line is harmless either way).
+    before = _CTX_INCLUDE.sub("", strip_comments(candidate[: m.start()])).strip()
     if before:
-        raise TypesError("the rematch:types block must come first in candidate.c")
+        raise TypesError(
+            'the rematch:types block must come first in candidate.c (after #include "ctx.h")'
+        )
     return m.group("body")
 
 

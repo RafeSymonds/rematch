@@ -104,6 +104,10 @@ class WorkerSection(_Section):
     # Header (relative to .rematch/) that learnings evidence includes as "types.h": typedefs
     # plus any pragmas the target's code always compiles under. Default: rematch's types.h.
     trial_header: str = ""
+    # ISA mode -> (prologue, epilogue) lines the harness puts around a function of that mode
+    # when the target's headers set another one, e.g. {arm = ["#pragma thumb off",
+    # "#pragma thumb on"]}. Used by the check and by integrated C pieces.
+    mode_wrap: dict[str, tuple[str, str]] = {}
 
 
 class ContextSection(_Section):

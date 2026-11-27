@@ -268,6 +268,7 @@ def run_live(
             effort=effort,
             system_prompt=prompt_file,
             gate=gate,
+            escalation=rung,
         )
         try:
             _, c = run_attempt(s, spec, log)

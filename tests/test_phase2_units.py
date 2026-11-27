@@ -160,6 +160,7 @@ def test_provisional_block_parses() -> None:
         ("unk_08", True),
     ]
     assert extract_block("int F(void) { return 0; }") is None
+    assert extract_block('#include "ctx.h"\n\n// note\n' + BLOCK) == body
     assert check_block(BLOCK.replace("unk_08 : 4", "unk_08_0 : 4"), "") is None  # bitfield suffix
     fptr = BLOCK.replace("u16 unk_04; // comment", "void (*unk_04[3])(void);")
     assert check_block(fptr, "") is None
@@ -170,6 +171,7 @@ def test_provisional_block_parses() -> None:
     ("candidate", "message"),
     [
         ("int x;\n" + BLOCK, "must come first"),
+        ('#include "ctx.h"\nint x;\n' + BLOCK, "must come first"),
         (BLOCK + BLOCK, "more than one"),
         ("/* rematch:types */\ntypedef struct UnkStruct_02001000 { u8 unk_00; } X;\n", "end-types"),
         (BLOCK.replace("UnkStruct_02001000", "MyStruct"), "UnkStruct_"),
@@ -463,3 +465,18 @@ def test_rate_limited_attempt_resumes_session(tmp_path: Path) -> None:
     assert len(argvs) == 2 and "--resume" not in argvs[0]
     assert argvs[1][argvs[1].index("--resume") + 1] == "sess-42"
     assert (tmp_path / "s.r1.jsonl").is_file()
+
+
+def test_scratch_source_wraps_the_candidate_for_its_isa_mode() -> None:
+    from rematch.toolchain.compile import scratch_source
+
+    out = scratch_source(
+        "int f(void) { return 0; }\n", "ctx.h", "#pragma thumb off", "#pragma thumb on"
+    )
+    assert out.splitlines() == [
+        '#include "ctx.h"',
+        "#pragma thumb off",
+        '#line 1 "candidate.c"',
+        "int f(void) { return 0; }",
+        "#pragma thumb on",
+    ]

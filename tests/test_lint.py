@@ -41,3 +41,17 @@ def test_failures_and_flags() -> None:
 
 def test_member_assignment_is_not_self_assignment() -> None:
     assert lint("void f(S *s, int x) { s->x = x; t.x = x; }").ok
+
+
+def test_pointer_math_on_a_struct_pointer_is_flagged() -> None:
+    from rematch.lint.readability import lint
+
+    src = (
+        '#include "ctx.h"\n'
+        "u16 F(UnkStruct_02000000 *p, u8 *buf) {\n"
+        "    return *(u16 *)((u8 *)p + 0x2C) + ((u8 *)buf)[3];\n"
+        "}\n"
+    )
+    r = lint(src)
+    assert r.ok
+    assert r.flag == ["pointer math on a struct pointer (line 3)"]

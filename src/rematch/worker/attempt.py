@@ -184,6 +184,7 @@ class AttemptSpec:
     system_prompt: Path
     claude_bin: str | None = None  # override (selftest fakes)
     gate: Gate | None = None  # shared pause after rate limits (bench/run)
+    escalation: int = 0  # ladder rung (live loop, SPEC §8.4)
 
 
 def _record_types(
@@ -232,13 +233,14 @@ def run_attempt(s: Session, spec: AttemptSpec, log: Log) -> tuple[int, Classifie
         with conn:
             cur = conn.execute(
                 "INSERT INTO attempts (run_id, function_id, task_kind, model, effort, escalation,"
-                " prompt_version, context_version, started_at) VALUES (?, ?, 'function', ?, ?, 0,"
+                " prompt_version, context_version, started_at) VALUES (?, ?, 'function', ?, ?, ?,"
                 " ?, ?, ?)",
                 (
                     spec.run_id,
                     spec.fn.id,
                     spec.model,
                     spec.effort,
+                    spec.escalation,
                     prompts.prompt_version(),
                     CONTEXT_VERSION,
                     now(),

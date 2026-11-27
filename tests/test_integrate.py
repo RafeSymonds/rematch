@@ -105,3 +105,23 @@ def test_compose_hoists_types_and_unifies_sibling_prototypes() -> None:
     assert "void *FuncB(int x);" in out and "u32 FuncB(int);" not in out
     assert out.count("extern int gX;") == 1
     assert definition_header("FuncB", b) == "void *FuncB(int x)"
+
+
+def test_indented_labels_are_exported() -> None:
+    # A data label indented in the vanilla source must still be found and exported.
+    tu = TU.replace("_02100000:\n\t.word 1, 2", "    _02100000:\n\t.word 1, 2")
+    parsed = parse_tu(tu)
+    pieces = plan_pieces("asm/foo.s", parsed, {"FuncB"})
+    texts = render_asm_pieces(parsed, pieces, c_undefined=set())
+    assert "\t.global _02100000" in texts["asm/foo.s"]
+
+
+def test_compose_wraps_functions_of_another_isa_mode() -> None:
+    a = '#include "ctx.h"\nvoid FuncA(void)\n{\n}\n'
+    b = '#include "ctx.h"\nvoid FuncB(void)\n{\n}\n'
+    wrap = ("#pragma thumb off", "#pragma thumb on")
+    out = compose_piece(["global.h"], [("FuncA", a), ("FuncB", b)], {"FuncB": wrap})
+    body = out[out.index("void FuncA(void)\n{") :]
+    assert body.index("void FuncA(void)\n{") < body.index("#pragma thumb off")
+    assert body.index("#pragma thumb off") < body.index("void FuncB(void)\n{")
+    assert body.rstrip().endswith("#pragma thumb on")

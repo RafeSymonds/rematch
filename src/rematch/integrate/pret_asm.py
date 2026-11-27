@@ -19,7 +19,7 @@ from rematch.inventory.asm_parser import AsmFunction, parse_pret_macros
 
 _SECTION = re.compile(r"^\s*\.(?:text|data|rodata|bss|section\s+\S+.*)\s*$")
 _TEXT = re.compile(r"^\s*\.text\s*$")
-_LABEL_DEF = re.compile(r"^([A-Za-z_.$][\w.$]*):")
+_LABEL_DEF = re.compile(r"^\s*([A-Za-z_.$][\w.$]*):")  # labels may be indented
 _TOKEN = re.compile(r"[A-Za-z_.$][\w.$]*")
 
 

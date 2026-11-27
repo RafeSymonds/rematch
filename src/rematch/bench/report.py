@@ -90,11 +90,13 @@ def run_metrics(conn: sqlite3.Connection, run_id: int) -> dict[str, object]:
     rows = conn.execute(
         "SELECT a.outcome, a.checks_used, a.num_turns, a.input_tokens, a.output_tokens,"
         " a.cache_read_tokens, a.cost_usd, a.started_at, a.ended_at, a.sandbox_path,"
-        " a.best_candidate_path, f.n_insns FROM attempts a JOIN functions f ON f.id = a.function_id"
+        " a.best_candidate_path, f.n_insns, a.escalation FROM attempts a"
+        " JOIN functions f ON f.id = a.function_id"
         " WHERE a.run_id = ?",
         (run_id,),
     ).fetchall()
     buckets: dict[str, Bucket] = {"all": Bucket(), "S": Bucket(), "M": Bucket(), "L": Bucket()}
+    rungs: dict[int, Bucket] = {}  # by ladder rung (attempts.escalation, SPEC §8.4)
     for (
         outcome,
         _checks,
@@ -108,8 +110,10 @@ def run_metrics(conn: sqlite3.Connection, run_id: int) -> dict[str, object]:
         sandbox,
         best,
         n_insns,
+        rung,
     ) in rows:
-        for b in (buckets["all"], buckets[bucket(int(n_insns or 0))]):
+        by_rung = rungs.setdefault(int(rung or 0), Bucket())
+        for b in (buckets["all"], buckets[bucket(int(n_insns or 0))], by_rung):
             b.n += 1
             b.outcomes[outcome or "unfinished"] = b.outcomes.get(outcome or "unfinished", 0) + 1
             b.first_check_compiled += int(_first_compiled(sandbox))
@@ -138,6 +142,7 @@ def run_metrics(conn: sqlite3.Connection, run_id: int) -> dict[str, object]:
         "started_at": run[3],
         "ended_at": run[4],
         "buckets": {k: v.as_dict() for k, v in buckets.items()},
+        "rungs": {str(k): v.as_dict() for k, v in sorted(rungs.items())},
     }
 
 
@@ -157,6 +162,14 @@ def format_report(m: dict[str, object]) -> str:
             f"{b['median_turns']}, tokens/match {b['tokens_per_match']}, "
             f"$/match {b['cost_per_match_usd']}, median wall {b['median_wall_seconds']} s"
         )
+    rungs = m.get("rungs") or {}
+    assert isinstance(rungs, dict)
+    if len(rungs) > 1 or m["kind"] == "live":
+        for rung, b in rungs.items():
+            lines.append(
+                f"rung {rung}: {b['matches']}/{b['attempts']} match ({b['match_rate']}%),"
+                f" $/match {b['cost_per_match_usd']}, total $ {b['cost_total_usd']}"
+            )
     lines.append(f"outcomes: {buckets['all']['outcomes']}")
     return "\n".join(lines)
 

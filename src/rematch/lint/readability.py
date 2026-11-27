@@ -11,7 +11,7 @@ import json
 import re
 from dataclasses import dataclass, field
 
-LINT_VERSION = 1
+LINT_VERSION = 2
 
 _COMMENT_OR_STRING = re.compile(
     r"/\*.*?\*/|//[^\n]*|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'", re.DOTALL
@@ -53,9 +53,23 @@ def _blank(match: re.Match[str]) -> str:
 _INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*(?!"ctx\.h")\S', re.MULTILINE)
 
 
+# Byte-pointer arithmetic on a variable declared as a pointer to a struct type (SPEC §9):
+# `*(u16 *)((u8 *)p + 0x2C)` where `p` could use a field. A flag until the rule can see
+# whether the struct has a field there.
+_STRUCT_PTR = re.compile(r"\b(Unk(?:Struct|Union)_\w+|[A-Z][a-z]\w*)\s*\*+\s*(?:const\s+)?(\w+)")
+_BYTE_MATH = re.compile(
+    r"\(\s*(?:const\s+)?(?:u8|s8|char|unsigned\s+char)\s*\*\s*\)\s*\(?\s*(\w+)\s*\)?\s*[+\[]"
+)
+
+
 def lint(source: str) -> LintResult:
     code = _COMMENT_OR_STRING.sub(_blank, source)
     out = LintResult()
+    struct_ptrs = {m.group(2) for m in _STRUCT_PTR.finditer(code)}
+    for m in _BYTE_MATH.finditer(code):
+        if m.group(1) in struct_ptrs:
+            line = code.count("\n", 0, m.start()) + 1
+            out.flag.append(f"pointer math on a struct pointer (line {line})")
     for m in _INCLUDE.finditer(source):
         out.fail.append(
             f'#include other than "ctx.h" (line {source.count(chr(10), 0, m.start()) + 1})'

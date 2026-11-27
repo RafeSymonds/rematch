@@ -89,20 +89,23 @@ The live pilot (50 untried functions) matched 96% at $0.10 per match once two ch
 
 **Exit criteria**
 - [x] At least 1 assembly TU fully converted, integrated and committed on `rematch/live`, with every version's hash passing on that commit
-- [ ] A 2-hour unattended `rematch run`, killed and restarted, with no orphaned leases
-- [ ] `integrate --verify-branch` passes on every `rematch/live` commit
+- [x] A 2-hour unattended `rematch run`, killed and restarted, with no orphaned leases (2h run: 1,784 attempts, 94% matched, 0 errors, 0 leases left; kill and restart recovered every lease in the shakedown)
+- [x] `integrate --verify-branch` passes on every `rematch/live` commit (22 of 22 at the time of the check)
 - [x] Report shows the live match rate, cost per match and the outcome distribution
 
 ## Phase 4b: Types and data for integrated code
 
-- `type_merge` task kind (SPEC §16.2): clustering, an agent proposes one definition, the gate re-verifies every match that uses it, and accepted types flow into ctx.h and the target's rematch types header on `rematch/live`.
-- Reference layouts from `REFERENCE_REPOS` (SPEC §16.3) as merge proposals through the same gate.
-- Lint: no raw pointer math into an object that has a type (SPEC §9).
-- `tu_data`: move a TU's data sections into C so fully matched TUs leave no assembly.
+- Integration batching: one build per batch of TU steps, culprit by name or bisection, crash journal, plan-hash skip, parallel preparation (SPEC §10).
+- Harness fixes from the 2h run: label-named assembly targets (jump tables), ARM-mode wrapping, block placement, rung per attempt.
+- `type_merge` (SPEC §16.2). Module-wide clustering was measured first (`rematch types merge`, a dry run: 16% of provisional types had an evidence-backed partner) and replaced by a per-TU agent step (`integrate --types`) gated by the piece check.
+- Reference layouts from `REFERENCE_REPOS` (SPEC §16.3): deferred until a reference repo is set up.
+- Lint: pointer math on struct pointers is flagged (SPEC §9, `LINT_VERSION` 2).
+- `tu_data`: move a fully converted TU's data sections into C so it leaves no assembly (`integrate --data`, data check by location).
+- `rematch run --finish`: the types and data steps run with the live loop.
 - 24-hour unattended live run.
 
 **Exit criteria**
-- [ ] At least one shared type accepted by `type_merge`, with every match in its `type_uses` re-verified at 100%, and at least one rejected merge that left the DB unchanged
+- [ ] At least one TU whose duplicate provisional types a `type_merge` attempt merged, every function re-verified by the piece check, and at least one failed attempt that left the piece unchanged (TU-local merging replaced module-wide clustering, SPEC §16.2)
 - [ ] An integrated TU compiles against shared or TU-local types only (no provisional duplicates)
 - [ ] A fully matched TU with data integrated with no assembly left
 - [ ] 24-hour unattended live run with no crashed orchestrator and no orphaned leases after restart
@@ -111,10 +114,10 @@ The live pilot (50 untried functions) matched 96% at $0.10 per match once two ch
 
 ## Phase 5: Long tail (ongoing)
 
-- Stagnation diagnostics: cluster stuck functions by failing hint category.
+- [x] Stagnation diagnostics: `rematch stuck` tallies failed functions by the hint categories of their best check.
 - TU-context compile for asm targets via a GLOBAL_ASM tool such as asm_processor.
-- Escalation ladder tuning. Readability cleanup pass on accepted matches (must stay 100%).
-- Human review queue (`rematch stuck`). Human fixes feed back as learnings.
+- Escalation ladder tuning: `rematch report` shows each rung's match rate and cost per match. Readability cleanup pass on accepted matches (must stay 100%).
+- [x] Human review queue (`rematch stuck`, `--show`, `--accept`). Human fixes feed back as learnings candidates.
 - Naming pass (SPEC §16.5): a cheaper model proposes function, type and field names from evidence, a human approves them with `rematch names review`, and the integrator applies accepted renames on `rematch/live` with the usual hash check.
 - Upstream sync routine (§12).
 

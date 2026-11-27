@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import re
 import sqlite3
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,8 @@ from rematch.context.header_index import HeaderIndex
 from rematch.context.m2c import apply_prototype, m2c_asm, run_m2c
 from rematch.diff.match import function_view
 from rematch.diff.objdump_backend import Line, disassemble, run_objdump
+from rematch.integrate.labels import LabelError, label_table
+from rematch.integrate.labels import pool_names as label_pool_names
 from rematch.inventory import asm_parser, link_order
 from rematch.inventory.c_parser import function_source, strip_comments, tu_local_context
 from rematch.learnings.rules import compiler_file, sandbox_text, target_file
@@ -198,16 +201,29 @@ def _rename(text: str, old: str, new: str) -> str:
 
 
 def _vanilla_lines(
-    s: Session, obj_path: Path, name: str, asm_text: str | None = None
+    s: Session,
+    obj_path: Path,
+    name: str,
+    asm_text: str | None = None,
+    entry: CompileEntry | None = None,
 ) -> tuple[ObjectFile, list[Line]]:
-    """The target's normalized lines. For an assembly function, `asm_text` (its source) names
-    literal-pool words that point at labels local to the assembly file."""
+    """The target's normalized lines. For an assembly function, relocations to labels local to
+    the assembly file are named from the TU's label table (`entry`, SPEC §6.5), or else from
+    the source's `.word` operands (`asm_text`) when their count agrees."""
     obj = read_object(obj_path)
     text = run_objdump(s.settings.objdump, obj.path)
     lines = disassemble(text, obj).get(name)
     if lines is None:
         raise SandboxError(f"{name} not found in {obj_path}")
-    names = asm_pool_names(asm_text, lines) if asm_text else {}
+    names: dict[int, str] = {}
+    func = obj.function(name)
+    if asm_text and entry is not None and func is not None:
+        try:
+            names = label_pool_names(obj, func, label_table(s, entry))
+        except (LabelError, OSError, subprocess.SubprocessError):
+            names = {}
+    if not names and asm_text:
+        names = asm_pool_names(asm_text, lines)
     if names:
         lines = disassemble(text, obj, pool_names={name: names})[name]
     return obj, lines
@@ -297,7 +313,7 @@ def build_sandbox(
         db = CompileDB.load(build_dir / build.compile_commands, s.worktree)
         tu_entry = db.entry(fn.tu_path)
         entry = tu_entry if fn.source_kind == "c_human" else db.c_template_for(fn.tu_path)
-        obj, lines = _vanilla_lines(s, tu_entry.object_path, fn.name, asm_source)
+        obj, lines = _vanilla_lines(s, tu_entry.object_path, fn.name, asm_source, tu_entry)
         save_target(control, version, lines, function_view(obj, fn.name, lines, fn.name))
         if i == 0:
             primary_lines = lines
@@ -407,6 +423,7 @@ def build_sandbox(
             encoding="utf-8",
         )
 
+    wrap = s.definition.worker.mode_wrap.get(fn.mode, ("", ""))
     task = Task(
         symbol=symbol,
         target_symbol=fn.name,
@@ -419,6 +436,8 @@ def build_sandbox(
         toolchain_exec=s.settings.toolchain_exec,
         objdump=s.settings.objdump,
         compile_timeout=s.settings.compile_timeout_sec,
+        prologue=wrap[0],
+        epilogue=wrap[1],
     )
     task.save(control)
     return task

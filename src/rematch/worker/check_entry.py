@@ -170,7 +170,7 @@ def evaluate(
     for vt in task.versions:
         scratch = build / f"scratch.{vt.version}.c"
         scratch.write_text(
-            scratch_source(body, (rel_ctx / vt.ctx).as_posix())
+            scratch_source(body, (rel_ctx / vt.ctx).as_posix(), task.prologue, task.epilogue)
             + keep_reference(candidate, task.symbol),
             encoding="utf-8",
         )

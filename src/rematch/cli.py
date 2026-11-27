@@ -449,21 +449,38 @@ def integrate_cmd(
     ready: bool = typer.Option(False, "--ready", help="Every TU with ready matches."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Plan and check pieces; write nothing."),
     fix: bool = typer.Option(False, "--fix", help="Run a tu_fix agent on failing pieces."),
+    data: bool = typer.Option(
+        False, "--data", help="tu_data: move fully converted TUs' data into C (with --fix)."
+    ),
+    types: bool = typer.Option(
+        False, "--types", help="Merge duplicate provisional types in fully converted TUs."
+    ),
     verify_branch_: bool = typer.Option(
         False, "--verify-branch", help="Build every rematch/live commit and check hashes."
+    ),
+    since: str | None = typer.Option(
+        None, help="--verify-branch: start after this commit (default: last verified)."
     ),
     model: str | None = typer.Option(None),
     effort: str | None = typer.Option(None),
     yes: bool = typer.Option(False, "--yes", help="Confirm token spend (with --fix)."),
 ) -> None:
     """Move matched functions into C on rematch/live, verified by full builds (SPEC §10)."""
-    from rematch.integrate.run import IntegrateError, integrate, ready_tus, verify_branch
+    from rematch.integrate.run import (
+        IntegrateError,
+        converted_tus,
+        data_ready_tus,
+        integrate,
+        ready_tus,
+        verify_branch,
+    )
+    from rematch.integrate.tu_data import run_tu_data
     from rematch.integrate.tu_fix import run_tu_fix
 
     s = _session()
     if verify_branch_:
         try:
-            results = verify_branch(s, _echo_err)
+            results = verify_branch(s, _echo_err, since)
         except IntegrateError as exc:
             typer.echo(f"FAIL {exc}")
             raise typer.Exit(1) from exc
@@ -489,14 +506,44 @@ def integrate_cmd(
                 fconn.close()
             return out.matched
 
+    data_fixer = None
+    if fix and data:
+        m, e = _model_effort(model, effort)
+
+        def data_fixer(
+            tu_path: str, functions: list[str], asm_piece: str, c_piece: str, asm: dict[str, str]
+        ) -> bool:
+            fconn = store.connect(s.db_path)
+            try:
+                out = run_tu_data(
+                    s, fconn, tu_path, functions, asm_piece, c_piece, asm, m, e, _echo_err
+                )
+            finally:
+                fconn.close()
+            return out.matched
+
     conn = store.connect(s.db_path)
     try:
-        tus = list(tu) or (ready_tus(conn) if ready else [])
+        if data:
+            tus = list(tu) or data_ready_tus(conn)
+        elif types:
+            tus = list(tu) or converted_tus(conn)
+        else:
+            tus = list(tu) or (ready_tus(conn) if ready else [])
         if not tus:
-            typer.echo("nothing to do: pass --tu or --ready")
+            typer.echo("nothing to do: pass --tu, --ready, --types or --data")
             raise typer.Exit(2)
         try:
-            outcomes = integrate(s, conn, tus, dry_run=dry_run, log=_echo_err, fix=fixer)
+            outcomes = integrate(
+                s,
+                conn,
+                tus,
+                dry_run=dry_run,
+                log=_echo_err,
+                fix=fixer,
+                step="data" if data else "types" if types else "functions",
+                fix_data=data_fixer,
+            )
         except IntegrateError as exc:
             typer.echo(f"FAIL {exc}")
             raise typer.Exit(1) from exc
@@ -518,6 +565,12 @@ def run_cmd(
     fix: bool = typer.Option(False, "--fix", help="Let integration run tu_fix agents."),
     no_publish: bool = typer.Option(
         False, "--no-publish", help="Don't merge into MERGE_BRANCH or push at the end."
+    ),
+    finish: bool = typer.Option(
+        False,
+        "--finish",
+        help="Also finish fully converted TUs: merge their provisional types, move their data"
+        " into C (agents with --fix).",
     ),
     yes: bool = typer.Option(False, "--yes", help="Confirm token spend."),
 ) -> None:
@@ -552,7 +605,23 @@ def run_cmd(
         finally:
             fconn.close()
 
+    def data_fixer(
+        tu_path: str, functions: list[str], asm_piece: str, c_piece: str, asm: dict[str, str]
+    ) -> bool:
+        from rematch.integrate.tu_data import run_tu_data
+
+        fconn = store.connect(s.db_path)
+        try:
+            m, e = _model_effort(None, None)
+            return run_tu_data(
+                s, fconn, tu_path, functions, asm_piece, c_piece, asm, m, e, _echo_err
+            ).matched
+        finally:
+            fconn.close()
+
     def integrate_ready() -> list[str]:
+        from rematch.integrate.run import converted_tus, data_ready_tus
+
         iconn = store.connect(s.db_path)
         try:
             outcomes = integrate(
@@ -563,6 +632,22 @@ def run_cmd(
                 log=_echo_err,
                 fix=fixer if fix else None,
             )
+            # finishing fully converted TUs: one type per object, then the data into C
+            if finish:
+                for step, tus in (
+                    ("types", converted_tus(iconn)),
+                    ("data", data_ready_tus(iconn)),
+                ):
+                    outcomes += integrate(
+                        s,
+                        iconn,
+                        tus,
+                        dry_run=False,
+                        log=_echo_err,
+                        fix=fixer if fix else None,
+                        step=step,
+                        fix_data=data_fixer if fix else None,
+                    )
         finally:
             iconn.close()
         for o in outcomes:
@@ -647,6 +732,56 @@ def status_cmd() -> None:
         conn.close()
 
 
+@app.command("stuck")
+def stuck_cmd(
+    module: str | None = typer.Option(None, help="Only this module."),
+    hint: str | None = typer.Option(None, help="Only functions whose best check had this hint."),
+    show: str | None = typer.Option(None, help="Print one function's best candidate and diff."),
+    accept: str | None = typer.Option(None, help="Record a human fix for this function."),
+    source: Path | None = typer.Option(None, help="The C file for --accept."),
+    limit: int = typer.Option(40, help="Rows to list."),
+) -> None:
+    """The review queue: failed and stuck functions, why they failed, human fixes (SPEC §8.4)."""
+    from rematch.live.stuck import accept_human, hint_tally, stuck_rows
+
+    s = _session()
+    if accept:
+        if source is None:
+            typer.echo("--accept needs --source FILE")
+            raise typer.Exit(2)
+        ok, detail = accept_human(s, accept, source.read_text(encoding="utf-8"))
+        typer.echo(f"{'MATCH' if ok else 'FAIL'} {accept}: {detail}")
+        raise typer.Exit(0 if ok else 1)
+    conn = store.connect(s.db_path)
+    try:
+        rows = stuck_rows(conn, module, hint)
+    finally:
+        conn.close()
+    if show:
+        row = next((r for r in rows if r.name == show), None)
+        if row is None:
+            typer.echo(f"{show} is not failed or stuck")
+            raise typer.Exit(1)
+        typer.echo(
+            f"{row.name} ({row.tu}, {row.n_insns} insns): {row.attempts} attempt(s),"
+            f" best {row.best_score:.1f}, ${row.cost:.2f}, hints {row.hints}"
+        )
+        for reason in row.reasons:
+            typer.echo(f"  {reason[:300]}")
+        if row.open_issues:
+            typer.echo(f"open issues: {row.open_issues}")
+        if row.best_candidate and Path(row.best_candidate).is_file():
+            typer.echo(f"--- best candidate ({row.best_candidate})")
+            typer.echo(Path(row.best_candidate).read_text(encoding="utf-8", errors="replace"))
+        return
+    typer.echo(f"{len(rows)} function(s); hints: {hint_tally(rows)}")
+    for r in sorted(rows, key=lambda r: -r.best_score)[:limit]:
+        typer.echo(
+            f"{r.status:6} {r.best_score:5.1f} {r.n_insns:4}i {r.attempts}x"
+            f" ${r.cost:5.2f} {r.name:24} {','.join(r.hints) or '-'}"
+        )
+
+
 @app.command("tu-check", hidden=True)
 def tu_check_cmd(
     sandbox: Path = typer.Option(...),
@@ -656,6 +791,19 @@ def tu_check_cmd(
     from rematch.integrate.tu_fix import tu_check
 
     text, code = tu_check(sandbox, control)
+    typer.echo(text)
+    raise typer.Exit(code)
+
+
+@app.command("data-check", hidden=True)
+def data_check_cmd(
+    sandbox: Path = typer.Option(...),
+    control: Path = typer.Option(...),
+) -> None:
+    """./check inside a tu_data sandbox."""
+    from rematch.integrate.tu_data import data_check
+
+    text, code = data_check(sandbox, control)
     typer.echo(text)
     raise typer.Exit(code)
 
@@ -891,3 +1039,45 @@ def learnings_verify(
         typer.echo(f"{'SKIP' if ok is None else 'PASS' if ok else 'FAIL'} {rid}: {why}")
     if any(ok is False for _, ok, _ in results):
         raise typer.Exit(1)
+
+
+types_app = typer.Typer(no_args_is_help=True, help="Provisional and shared types (SPEC §16).")
+app.add_typer(types_app, name="types")
+
+
+@types_app.command("merge")
+def types_merge(
+    module: str | None = typer.Option(None, help="Only this module."),
+    layout: bool = typer.Option(False, "--layout", help="Also link types by matching layout."),
+    dry_run: bool = typer.Option(True, "--dry-run/--apply", help="Report clusters only."),
+) -> None:
+    """Cluster provisional types that are the same type, per module (SPEC §16.2)."""
+    from rematch.types.merge import cluster, evidence, load_uses, stats
+
+    s = _session()
+    conn = store.connect(s.db_path)
+    try:
+        uses = load_uses(conn, module)
+        modules = sorted({u.module for u in uses})
+        sources: dict[str, dict[int, tuple[str, str]]] = {}
+        for fid, name, mod, src in conn.execute(
+            "SELECT f.id, f.name, f.module, m.c_source FROM functions f JOIN matches m"
+            " ON m.function_id = f.id WHERE f.status IN ('matched', 'integrated')"
+        ):
+            sources.setdefault(str(mod), {})[int(fid)] = (str(name), str(src))
+    finally:
+        conn.close()
+    total_multi = total = 0
+    for mod in modules:
+        mod_uses = [u for u in uses if u.module == mod]
+        edges = evidence(mod_uses, sources.get(mod, {}), layout)
+        clusters, refused = cluster(mod_uses, edges)
+        multi = [c for c in clusters if len(c.members) > 1]
+        total += len(mod_uses)
+        total_multi += sum(len(c.members) for c in multi)
+        if multi or module:
+            typer.echo(f"{mod}: {stats(clusters, refused, edges)}")
+    typer.echo(f"all: {total} types, {total_multi} in clusters of 2+")
+    if not dry_run:
+        typer.echo("the merge gate is not built yet; nothing changed")
+        raise typer.Exit(2)

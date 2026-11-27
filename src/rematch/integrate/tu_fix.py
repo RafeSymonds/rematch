@@ -18,7 +18,7 @@ from pathlib import Path
 
 from rematch import prompts
 from rematch.context import CONTEXT_VERSION
-from rematch.integrate.piece import PieceResult, PieceSpec, check_source
+from rematch.integrate.piece import PieceResult, PieceSpec, check_source, provisional_count
 from rematch.session import Session
 from rematch.worker.attempt import (
     AttemptSpec,
@@ -44,7 +44,8 @@ def tu_check(sandbox: Path, control: Path) -> tuple[str, int]:
     spec = PieceSpec.load(control)
     state_path = control / STATE
     state = json.loads(state_path.read_text()) if state_path.is_file() else {"checks": 0}
-    if state.get("matched"):
+    types = spec.types_below is not None
+    if state.get("matched") and not types:  # the types step may keep merging after a pass
         return "MATCH already recorded. Write SUMMARY.json and end.", 0
     if state["checks"] >= spec.max_checks:
         return f"STOP: check limit ({spec.max_checks}) reached. Write SUMMARY.json and end.", 1
@@ -54,18 +55,32 @@ def tu_check(sandbox: Path, control: Path) -> tuple[str, int]:
     history.mkdir(parents=True, exist_ok=True)
     (history / f"{state['checks']:03d}.c").write_text(source, encoding="utf-8")
     result = check_source(spec, control, source, control / "build")
+    if spec.types_below is not None and result.ok:
+        n = provisional_count(source)
+        if n >= spec.types_below:
+            result.ok = False
+            result.errors.append(
+                f"every function matches, but {n} provisional typedefs remain;"
+                f" merge duplicates until fewer than {spec.types_below} are left"
+            )
     best = state.get("best_matched", -1)
     if result.matched > best and not result.errors:
         state["best_matched"] = result.matched
         state["best_check"] = state["checks"]
     if result.ok:
         state["matched"] = True
-        state["best_check"] = state["checks"]
+        count = provisional_count(source) if types else 0
+        if not types or count < int(state.get("best_types", spec.types_below or 0)):
+            state["best_types"] = count
+            state["best_check"] = state["checks"]
     state_path.write_text(json.dumps(state), encoding="utf-8")
     head = (
         f"check {state['checks']}/{spec.max_checks} | "
         f"{result.matched}/{len(spec.functions)} functions match"
     )
+    if spec.types_below is not None:
+        head += f" | {provisional_count(source)} provisional typedefs (started with"
+        head += f" {spec.types_below})"
     if result.ok:
         return f"MATCH ({head})", 0
     return head + "\n" + result.report(), 1
@@ -83,8 +98,14 @@ class FixOutcome:
 
 
 def _task_md(spec: PieceSpec, first: PieceResult) -> str:
+    goal = (
+        f"merge duplicate provisional types in candidate.c ({spec.tu}); every function must"
+        " keep matching"
+        if spec.types_below is not None
+        else f"make candidate.c compile with every function matching ({spec.tu})"
+    )
     return (
-        f"# Task: make candidate.c compile with every function matching ({spec.tu})\n\n"
+        f"# Task: {goal}\n\n"
         f"Functions, in order: {', '.join(spec.functions)}. Their assembly is in targets/.\n"
         "ctx.h is the flattened content of candidate.c's headers: grep it for declarations;"
         " never read it whole.\n\n"
@@ -103,17 +124,21 @@ def run_tu_fix(
     effort: str,
     log: Log,
 ) -> FixOutcome:
+    """A tu_fix attempt, or with `types_below` set in the piece spec, the types step: merge
+    duplicate provisional types (task kind `type_merge`, SPEC §16.2)."""
     spec = PieceSpec.load(control_src)
-    run_id = start_run(conn, "live", run_config(s, model, effort, {"tu_fix": spec.tu}), None)
+    types = spec.types_below is not None
+    kind, prompt = ("type_merge", "tu_types.md") if types else ("tu_fix", "tu_fix.md")
+    run_id = start_run(conn, "live", run_config(s, model, effort, {kind: spec.tu}), None)
     with conn:
         cur = conn.execute(
             "INSERT INTO attempts (run_id, function_id, task_kind, model, effort, escalation,"
-            " prompt_version, context_version, started_at) VALUES (?, NULL, 'tu_fix', ?, ?, 0,"
+            " prompt_version, context_version, started_at) VALUES (?, NULL, ?, ?, ?, 0,"
             " ?, ?, ?)",
-            (run_id, model, effort, 1, CONTEXT_VERSION, now()),
+            (run_id, kind, model, effort, 1, CONTEXT_VERSION, now()),
         )
     attempt_id = int(cur.lastrowid or 0)
-    sandbox = s.settings.rematch_workdir.expanduser() / "tu_fix" / str(attempt_id)
+    sandbox = s.settings.rematch_workdir.expanduser() / kind / str(attempt_id)
     control = s.settings.rematch_var / "runs" / str(run_id) / str(attempt_id) / "control"
     shutil.rmtree(control, ignore_errors=True)
     shutil.copytree(control_src, control, ignore=shutil.ignore_patterns("build", "history", STATE))
@@ -144,7 +169,7 @@ def run_tu_fix(
     check.chmod(0o755)
     system = control.parent / "system.md"
     system.write_text(
-        prompts.render("tu_fix.md", target_intro=s.definition.worker.intro), encoding="utf-8"
+        prompts.render(prompt, target_intro=s.definition.worker.intro), encoding="utf-8"
     )
     cfg = InvokeConfig(
         claude_bin=s.settings.claude_bin,
@@ -189,9 +214,16 @@ def run_tu_fix(
             fixed = (control / "history" / f"{best:03d}.c").read_text(encoding="utf-8")
             conn.execute(
                 "INSERT INTO piece_sources (tu_path, functions_json, source, attempt_id,"
-                " created_at) VALUES (?, ?, ?, ?, ?)",
-                (spec.tu, json.dumps(spec.functions), fixed, attempt_id, now()),
+                " created_at, kind) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    spec.tu,
+                    json.dumps(spec.functions),
+                    fixed,
+                    attempt_id,
+                    now(),
+                    "types" if types else "functions",
+                ),
             )
-    finish_run(conn, run_id, notes=f"tu_fix {spec.tu}")
-    log(f"tu_fix {spec.tu}: {'match' if matched else 'no fix'} ({state.get('checks', 0)} checks)")
+    finish_run(conn, run_id, notes=f"{kind} {spec.tu}")
+    log(f"{kind} {spec.tu}: {'match' if matched else 'no fix'} ({state.get('checks', 0)} checks)")
     return FixOutcome(attempt_id, matched, int(state.get("checks", 0)), totals.cost_usd)

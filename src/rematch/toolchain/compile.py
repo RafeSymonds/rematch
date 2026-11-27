@@ -27,9 +27,15 @@ class CompileResult:
     seconds: float
 
 
-def scratch_source(candidate: str, ctx_name: str = "ctx.h") -> str:
-    """`#include` the context, then reset line numbers so diagnostics point into candidate.c."""
-    return f'#include "{ctx_name}"\n#line 1 "candidate.c"\n{candidate}'
+def scratch_source(
+    candidate: str, ctx_name: str = "ctx.h", prologue: str = "", epilogue: str = ""
+) -> str:
+    """`#include` the context, then reset line numbers so diagnostics point into candidate.c.
+    `prologue`/`epilogue` wrap the candidate, e.g. to compile it in another ISA mode."""
+    head = f'#include "{ctx_name}"\n' + (f"{prologue.rstrip()}\n" if prologue else "")
+    sep = "" if candidate.endswith("\n") else "\n"
+    tail = f"{sep}{epilogue.rstrip()}\n" if epilogue else ""
+    return f'{head}#line 1 "candidate.c"\n{candidate}{tail}'
 
 
 def tidy_errors(output: str) -> tuple[str, ...]:

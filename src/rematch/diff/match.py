@@ -11,10 +11,13 @@ Everything else is byte-exact.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from rematch.diff.objdump_backend import Line, describe_target
-from rematch.toolchain.objects import ObjectFile
+from rematch.toolchain.objects import ObjectFile, Symbol
+
+Resolver = Callable[[Symbol, int], str | None]  # (target symbol, addend) -> name or None
 
 _CALL_TYPES = {
     "R_ARM_THM_CALL": 4,
@@ -49,7 +52,14 @@ class MatchResult:
     reasons: tuple[str, ...]
 
 
-def function_view(obj: ObjectFile, name: str, lines: list[Line], self_name: str) -> FunctionView:
+def function_view(
+    obj: ObjectFile,
+    name: str,
+    lines: list[Line],
+    self_name: str,
+    resolve: Resolver | None = None,
+) -> FunctionView:
+    """`resolve`, when given, names non-call targets first (e.g. by location, SPEC §10)."""
     sym = obj.function(name)
     if sym is None or sym.section is None:
         raise KeyError(f"{name} is not a sized function in {obj.path}")
@@ -67,7 +77,12 @@ def function_view(obj: ObjectFile, name: str, lines: list[Line], self_name: str)
             target = describe_target(obj, r.symbol, r.addend + _CALL_TYPES[r.type], self_name)
             kind = f"call:{mnemonic_at.get(off, 'bl')}"
         else:
-            target = word_target.get(off) or describe_target(obj, r.symbol, r.addend, self_name)
+            located = resolve(r.symbol, r.addend) if resolve is not None else None
+            target = (
+                located
+                or word_target.get(off)
+                or describe_target(obj, r.symbol, r.addend, self_name)
+            )
             kind = r.type
         entries[off] = RelocEntry(off, kind, target)
         code[off : off + r.width] = bytes(r.width)

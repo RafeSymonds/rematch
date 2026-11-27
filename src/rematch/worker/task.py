@@ -61,6 +61,10 @@ class Task(BaseModel):
     toolchain_exec: str
     objdump: str
     compile_timeout: float
+    # Lines around the candidate for its ISA mode (target.toml [worker] mode_wrap), added by
+    # the harness: workers may not write #pragma.
+    prologue: str = ""
+    epilogue: str = ""
 
     def save(self, sandbox: Path) -> None:
         (sandbox / TASK_FILE).write_text(self.model_dump_json(indent=2) + "\n", encoding="utf-8")

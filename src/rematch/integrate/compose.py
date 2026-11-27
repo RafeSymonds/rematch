@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import re
 
+from rematch.context.protos import remove_block as remove_protos_block
+
 _CTX_INCLUDE = re.compile(r'^\s*#\s*include\s*"ctx\.h"\s*$')
 _TYPES_BLOCK = re.compile(r"/\*\s*rematch:types\s*\*/.*?/\*\s*rematch:end-types\s*\*/", re.S)
 
@@ -64,6 +66,7 @@ def compose_piece(
     # provisional types first (names are address-unique), then prototypes that may use them
     stripped: list[tuple[str, str]] = []
     for name, source in sources:
+        source = remove_protos_block(source)  # integration moves these into the headers
         m = _TYPES_BLOCK.search(source)
         if m:
             inner = re.sub(r"/\*\s*rematch:(?:end-)?types\s*\*/", "", m.group(0))

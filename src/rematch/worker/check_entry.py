@@ -13,6 +13,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from rematch.context.protos import ProtosError, strip_declarations
+from rematch.context.protos import extract as extract_protos
 from rematch.diff.hints import hints
 from rematch.diff.match import FunctionView, RelocEntry, binary_match, function_view
 from rematch.diff.objdump_backend import Line, disassemble, run_objdump
@@ -88,6 +90,18 @@ def prefilter(candidate: str, symbol: str) -> str | None:
     return None
 
 
+def protos_rejection(protos: dict[str, str], task: Task) -> str | None:
+    """Reason to reject a rematch:protos block, or None."""
+    bad = sorted(set(protos) - set(task.protos_allowed))
+    if not bad:
+        return None
+    allowed = ", ".join(task.protos_allowed) or "nothing in this task"
+    return (
+        f"rematch:protos may only redeclare the target and assembly-only callees ({allowed});"
+        f" not {', '.join(bad)}"
+    )
+
+
 def keep_reference(candidate: str, symbol: str) -> str:
     """Force a static definition to be emitted: nothing references it in isolation."""
     for f in parse_c_functions(candidate):
@@ -155,9 +169,17 @@ def evaluate(
     the orchestrator can re-verify a candidate this way (SPEC §7.4).
     """
     rejected = prefilter(candidate, task.symbol)
+    protos: dict[str, str] = {}
     if rejected is None:
         ctx_text = (sandbox / task.versions[0].ctx).read_text(encoding="utf-8", errors="replace")
         rejected = check_block(candidate, ctx_text)
+    if rejected is None:
+        try:
+            protos = extract_protos(candidate)
+        except ProtosError as exc:
+            rejected = str(exc)
+        else:
+            rejected = protos_rejection(protos, task)
     if rejected is not None:
         return rejected, [], []
     runner = ToolchainRunner.from_spec(task.toolchain_exec)
@@ -169,8 +191,22 @@ def evaluate(
     body = _OWN_CTX_INCLUDE.sub("", candidate)
     for vt in task.versions:
         scratch = build / f"scratch.{vt.version}.c"
+        ctx_ref = (rel_ctx / vt.ctx).as_posix()
+        if protos:  # the block replaces ctx.h's declarations of these names
+            text = (sandbox / vt.ctx).read_text(encoding="utf-8", errors="replace")
+            stripped, found = strip_declarations(text, list(protos))
+            missing = sorted(set(protos) - found)
+            if missing:
+                return (
+                    f"rematch:protos redeclares {', '.join(missing)}, which {vt.ctx} does not"
+                    " declare: write an ordinary prototype instead",
+                    [],
+                    [],
+                )
+            ctx_ref = f"ctx.protos.{vt.version}.h"
+            (build / ctx_ref).write_text(stripped, encoding="utf-8")
         scratch.write_text(
-            scratch_source(body, (rel_ctx / vt.ctx).as_posix(), task.prologue, task.epilogue)
+            scratch_source(body, ctx_ref, task.prologue, task.epilogue)
             + keep_reference(candidate, task.symbol),
             encoding="utf-8",
         )

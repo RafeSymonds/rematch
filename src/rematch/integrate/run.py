@@ -23,10 +23,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from rematch.context.header_index import HeaderIndex
+from rematch.context.protos import ProtosError
+from rematch.context.protos import extract as extract_protos
 from rematch.db import store
 from rematch.diff.match import function_view
 from rematch.doctor import sha1_file
 from rematch.integrate.compose import compose_piece
+from rematch.integrate.headers import committed_headers, compile_spec, header_edits, with_edits
 from rematch.integrate.linkspec import WRITERS
 from rematch.integrate.piece import PieceSpec, check_source, provisional_count, save_targets
 from rematch.integrate.pret_asm import ParsedTU, Piece, SplitError, parse_tu, plan_pieces
@@ -36,7 +39,6 @@ from rematch.session import Session
 from rematch.toolchain.compile_db import CompileDB
 from rematch.worker.attempt import now
 from rematch.worker.sandbox import FunctionRecord, _vanilla_lines, context_stub
-from rematch.worker.task import CompileSpec
 
 Log = Callable[[str], None]
 Writer = Callable[[str, list[str], list[str]], str]  # link-order text, old, new -> text
@@ -175,11 +177,12 @@ def prepare_piece(
     includes: list[str] = []
     compile_specs: dict[str, dict[str, object]] = {}
     offsets: dict[str, dict[str, int]] = {}
+    headers = piece_headers(s, piece_overrides([sources[n] for n in piece.functions]))
     for vi, version in enumerate(s.target.versions()):
         db = CompileDB.load(
             s.definition.build_dir(s.worktree, version) / build.compile_commands, s.worktree
         )
-        compile_specs[version] = CompileSpec.of(db.c_template_for(tu)).model_dump()
+        compile_specs[version] = compile_spec(s, db.c_template_for(tu), headers)
         offsets[version] = {}
         first: int | None = None
         for name in piece.functions:
@@ -212,6 +215,27 @@ def prepare_piece(
         if f.name in piece.functions and f.mode in mode_wrap
     }
     return spec, compose_piece(includes, [(n, sources[n]) for n in piece.functions], wraps)
+
+
+def piece_overrides(sources: list[str]) -> dict[str, str]:
+    """name -> prototype from the candidates' rematch:protos blocks (first one wins)."""
+    out: dict[str, str] = {}
+    for source in sources:
+        try:
+            for name, decl in extract_protos(source).items():
+                out.setdefault(name, decl)
+        except ProtosError:
+            continue
+    return out
+
+
+def piece_headers(s: Session, overrides: dict[str, str]) -> Path | None:
+    """rematch/live's committed headers, with `overrides` applied when they change any."""
+    base = committed_headers(s)
+    if base is None or not overrides:
+        return base
+    dirs = s.definition.build_info.header_dirs if s.definition.build_info else []
+    return with_edits(base, header_edits(base, dirs, overrides))
 
 
 def check_piece(
@@ -364,6 +388,7 @@ class PreparedTU:
     order: list[str]  # the TU's pieces in link order after this step
     plan_hash: str
     message: str  # `<tu> to C (N functions, M in C)`
+    overrides: dict[str, str] = field(default_factory=dict)  # name -> prototype, for headers
 
 
 def plan_hash(conn: sqlite3.Connection, plan: TUPlan, sources: dict[str, str]) -> str:
@@ -379,12 +404,16 @@ def plan_hash(conn: sqlite3.Connection, plan: TUPlan, sources: dict[str, str]) -
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
-def last_failed_hash(conn: sqlite3.Connection, tu: str) -> str | None:
+def failed_before(conn: sqlite3.Connection, tu: str, h: str) -> bool:
+    """True if a step with these exact inputs already failed for the TU. Any earlier row
+    counts, not only the latest: the types and data steps of one TU alternate, so the latest
+    row is often the other step's."""
     row = conn.execute(
-        "SELECT status, plan_hash FROM integrations WHERE tu_path = ? ORDER BY id DESC LIMIT 1",
-        (tu,),
+        "SELECT 1 FROM integrations WHERE tu_path = ? AND status = 'failed' AND plan_hash = ?"
+        " LIMIT 1",
+        (tu, h),
     ).fetchone()
-    return str(row[1]) if row and row[0] == "failed" and row[1] else None
+    return row is not None
 
 
 def prepare_tu(
@@ -412,7 +441,7 @@ def prepare_tu(
         ).fetchall()
     )
     h = plan_hash(conn, plan, sources)
-    if last_failed_hash(conn, tu) == h:
+    if failed_before(conn, tu, h):
         return Outcome(tu, "skipped", "unchanged since its last failure", plan.new)
     work = s.settings.rematch_workdir.expanduser() / "integrate" / tu.replace("/", "_")
     checks = [
@@ -439,7 +468,8 @@ def prepare_tu(
     files = {c.piece.path: c.source for c in checks}
     files.update(render_pret_pieces(parsed, plan.pieces, c_undefined))
     message = f"{tu} to C ({len(plan.new)} functions, {len(plan.in_c)} in C)"
-    return PreparedTU(plan, files, [p.path for p in plan.pieces], h, message)
+    overrides = piece_overrides([sources[n] for n in plan.in_c if n in sources])
+    return PreparedTU(plan, files, [p.path for p in plan.pieces], h, message, overrides)
 
 
 DataFix = Callable[[str, list[str], str, str, dict[str, str]], bool]
@@ -456,10 +486,37 @@ def converted_tus(conn: sqlite3.Connection) -> list[str]:
     return [str(r[0]) for r in rows]
 
 
-def data_ready_tus(conn: sqlite3.Connection) -> list[str]:
-    """Fully converted TUs that still have an assembly piece."""
-    return [
+def data_ready_tus(conn: sqlite3.Connection, s: Session | None = None) -> list[str]:
+    """Fully converted TUs that still have an assembly piece, plus (with `s`) assembly TUs
+    that hold only data."""
+    out = [
         tu for tu in converted_tus(conn) if any(p.endswith(".s") for p in current_pieces(conn, tu))
+    ]
+    return out + (data_only_tus(s, conn) if s is not None else [])
+
+
+def data_only_tus(s: Session, conn: sqlite3.Connection) -> list[str]:
+    """Assembly TUs in the link order with no functions, still assembly on rematch/live."""
+    from fnmatch import fnmatch
+
+    from rematch.inventory import link_order as link_order_parsers
+
+    link = s.definition.require(s.definition.link_order, "link_order")
+    tus = link_order_parsers.PARSERS[link.format](
+        (s.worktree / link.file).read_text(encoding="utf-8")
+    )
+    with_functions = {str(r[0]) for r in conn.execute("SELECT DISTINCT tu_path FROM functions")}
+    exclude = s.definition.source.exclude if s.definition.source else []
+    live = s.settings.live_worktree
+    return [
+        tu.path
+        for tu in tus
+        if tu.path.endswith(".s")
+        and tu.path not in with_functions
+        and not any(fnmatch(tu.path, g) for g in exclude)
+        and current_pieces(conn, tu.path) == [tu.path]
+        and live is not None
+        and (live / tu.path).is_file()
     ]
 
 
@@ -480,12 +537,14 @@ def prepare_data_tu(
     if live is None:
         raise IntegrateError("LIVE_WORKTREE is not set")
     pieces = current_pieces(conn, tu)
+    parsed = parse_tu((s.worktree / tu).read_text(encoding="utf-8", errors="replace"))
+    functions = [f.name for f in parsed.functions]
     pair = data_piece_text(live, pieces)
+    if pair is None and not functions and pieces == [tu]:
+        pair = (tu, f"src/{Path(tu).stem}.c")  # a data-only TU becomes a new C file
     if pair is None:
         return Outcome(tu, "skipped", "not one data piece and one C file")
     asm_piece, c_piece = pair
-    parsed = parse_tu((s.worktree / tu).read_text(encoding="utf-8", errors="replace"))
-    functions = [f.name for f in parsed.functions]
     plan = TUPlan(tu, functions, [], [Piece("c", c_piece, functions)], pieces)
 
     def inputs_hash(source: str | None) -> str:
@@ -493,7 +552,7 @@ def prepare_data_tu(
         return hashlib.sha256(blob.encode()).hexdigest()
 
     source = stored_source(conn, tu, functions, "data")
-    if last_failed_hash(conn, tu) == inputs_hash(source):
+    if failed_before(conn, tu, inputs_hash(source)):
         return Outcome(tu, "skipped", "unchanged since its last failure")
     if source is None:
         if fix_data is None:
@@ -543,7 +602,7 @@ def prepare_types_tu(
         return Outcome(tu, "skipped", "pieces are not the function pieces (data already in C?)")
     texts = {p.path: (live / p.path).read_text(encoding="utf-8") for p in planned if p.kind == "c"}
     h = hashlib.sha256(json.dumps(["types", pieces, texts], sort_keys=True).encode()).hexdigest()
-    if last_failed_hash(conn, tu) == h:
+    if failed_before(conn, tu, h):
         return Outcome(tu, "skipped", "unchanged since its last failure")
     sources = dict(
         conn.execute(
@@ -555,9 +614,13 @@ def prepare_types_tu(
     work = s.settings.rematch_workdir.expanduser() / "integrate_types" / tu.replace("/", "_")
     asm = {f.name: f.text for f in parsed.functions}
     files: dict[str, str] = {}
-    tried = False
+    tried = merged = False
     for piece in planned:
         if piece.kind != "c" or provisional_count(texts[piece.path]) < 2:
+            continue
+        source = stored_source(conn, tu, piece.functions, "types")
+        if source == texts[piece.path]:  # this piece already carries its merged types
+            merged = True
             continue
         tried = True
         before = provisional_count(texts[piece.path])
@@ -565,7 +628,6 @@ def prepare_types_tu(
         spec, _ = prepare_piece(s, tu, tu_text, parsed, piece, sources, control)
         spec.types_below = before
         spec.save(control)
-        source = stored_source(conn, tu, piece.functions, "types")
         if source is None and fix is not None:
             pending = PieceCheck(piece, False, [], set(), texts[piece.path], control)
             if fix(tu, pending, asm):
@@ -577,7 +639,8 @@ def prepare_types_tu(
     plan = TUPlan(tu, done, [], planned, pieces)
     if not files:
         if not tried:
-            return Outcome(tu, "skipped", "no piece with duplicate provisional types")
+            why = "types already merged" if merged else "no piece with duplicate provisional types"
+            return Outcome(tu, "skipped", why)
         if record:
             _record(conn, plan, "failed", None, "types: no merged source", h)
         return Outcome(tu, "failed", "types: no merged source")
@@ -610,11 +673,25 @@ def recover_journal(s: Session, log: Log) -> None:
     path.unlink()
 
 
+def _header_writes(s: Session, live: Path, batch: list[PreparedTU]) -> dict[str, str]:
+    """Header path -> text with the batch's prototype overrides applied to the live tree."""
+    overrides: dict[str, str] = {}
+    for p in batch:
+        overrides.update(p.overrides)
+    if not overrides or s.definition.build_info is None:
+        return {}
+    return header_edits(live, s.definition.build_info.header_dirs, overrides)
+
+
 def _apply(
     s: Session, live: Path, link_file: str, writer: Writer, batch: list[PreparedTU]
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
+    """Write the batch. Returns (every path written or removed, the paths to `git add`)."""
+    headers = _header_writes(s, live, batch)
     written = sorted(
-        {f for p in batch for f in p.files} | {o for p in batch for o in p.plan.old_pieces}
+        {f for p in batch for f in p.files}
+        | {o for p in batch for o in p.plan.old_pieces}
+        | set(headers)
     )
     _journal(s).write_text(json.dumps(written), encoding="utf-8")
     spec = live / link_file
@@ -627,7 +704,10 @@ def _apply(
             (live / path).write_text(content, encoding="utf-8")
         text = writer(text, p.plan.old_pieces, p.order)
     spec.write_text(text, encoding="utf-8")
-    return written
+    for path, content in headers.items():
+        (live / path).write_text(content, encoding="utf-8")
+    added = sorted({f for p in batch for f in p.files} | set(headers) | {link_file})
+    return written, added
 
 
 def culprit(problems: list[str], batch: list[PreparedTU]) -> PreparedTU | None:
@@ -657,12 +737,12 @@ def _land(
     """Write, build once, commit. On a failed build, find the culprit by name or by halves;
     each passing part is committed before the next part is written. True if the whole batch
     landed in one build."""
-    written = _apply(s, live, link_file, writer, batch)
+    written, added = _apply(s, live, link_file, writer, batch)
     try:
         problems = _build_all(s, live, log)
         if not problems:
             # removed pieces are already staged by `git rm`
-            _git(live, "add", "-A", "--", *sorted({f for p in batch for f in p.files}), link_file)
+            _git(live, "add", "-A", "--", *added)
             if len(batch) == 1:
                 _git(live, "commit", "-q", "-m", f"rematch: {batch[0].message}")
             else:
@@ -721,10 +801,13 @@ def integrate(
     fix: Callable[[str, PieceCheck, dict[str, str]], bool] | None = None,
     step: str = "functions",
     fix_data: DataFix | None = None,
+    steps: list[tuple[str, list[str]]] | None = None,
 ) -> list[Outcome]:
     """Prepare every TU (plan, piece check, optional `fix`), then land the prepared steps in
     batches, one build per batch (SPEC §10). `step` is "functions", "types" (merge
-    provisional types in fully converted TUs) or "data" (`tu_data`).
+    provisional types in fully converted TUs), "data" (`tu_data`) or "finish" (types, then
+    data when the types step has nothing to land). `steps` runs several (step, TUs) jobs in
+    one pool, in order, landing them in shared batches: a TU must appear in only one of them.
     `fix(tu, failed_check, asm_by_function)` runs a tu_fix attempt; True if it stored a
     passing source, after which the TU is checked again."""
     if s.definition.asm is None or s.definition.asm.format != "pret-macros":
@@ -742,23 +825,31 @@ def integrate(
             live = live_worktree(s)
         prepared: list[PreparedTU] = []
 
-        def prepare(tu: str) -> PreparedTU | Outcome | Exception:
+        def prepare(kind: str, tu: str) -> PreparedTU | Outcome | Exception:
             # each preparing thread has its own connection; landing stays on this thread
             pconn = store.connect(s.db_path)
+            record = not dry_run
             try:
-                if step == "data":
-                    return prepare_data_tu(s, pconn, tu, record=not dry_run, fix_data=fix_data)
-                if step == "types":
-                    return prepare_types_tu(s, pconn, tu, record=not dry_run, fix=fix)
-                return prepare_tu(s, pconn, tu, record=not dry_run, fix=fix)
+                if kind == "finish":
+                    r = prepare_types_tu(s, pconn, tu, record=record, fix=fix)
+                    if isinstance(r, PreparedTU):
+                        return r  # the data step follows next cycle, on the merged types
+                    d = prepare_data_tu(s, pconn, tu, record=record, fix_data=fix_data)
+                    return r if isinstance(d, Outcome) and d.status == "skipped" else d
+                if kind == "data":
+                    return prepare_data_tu(s, pconn, tu, record=record, fix_data=fix_data)
+                if kind == "types":
+                    return prepare_types_tu(s, pconn, tu, record=record, fix=fix)
+                return prepare_tu(s, pconn, tu, record=record, fix=fix)
             except Exception as exc:  # one TU's surprise must not stop the others
                 return exc
             finally:
                 pconn.close()
 
+        jobs = [(kind, tu) for kind, kind_tus in (steps or [(step, tus)]) for tu in kind_tus]
         pool = ThreadPoolExecutor(max(1, s.settings.integrate_workers))
         try:
-            futures = {pool.submit(prepare, tu): tu for tu in tus}
+            futures = {pool.submit(prepare, kind, tu): tu for kind, tu in jobs}
             for future in as_completed(futures):
                 tu, r = futures[future], future.result()
                 if isinstance(r, Exception):

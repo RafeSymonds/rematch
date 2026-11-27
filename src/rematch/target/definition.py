@@ -54,13 +54,16 @@ class BuildSection(_Section):
     # Untracked paths (globs, relative to the repo) a fresh worktree needs before it can build,
     # such as fetched toolchains or dependencies. Copied from the live worktree (§10).
     worktree_copy: list[str] = []
+    # Header directories (relative to the repo) that integration may edit: a rematch:protos
+    # block replaces a placeholder prototype there (§10). Empty: prototypes can't be overridden.
+    header_dirs: list[str] = []
 
     @field_validator("compile_commands", "map")
     @classmethod
     def _relative(cls, value: str) -> str:
         return _check_relative(value)
 
-    @field_validator("worktree_copy")
+    @field_validator("worktree_copy", "header_dirs")
     @classmethod
     def _relative_all(cls, value: list[str]) -> list[str]:
         return [_check_relative(v) for v in value]

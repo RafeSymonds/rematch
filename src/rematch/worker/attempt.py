@@ -200,7 +200,10 @@ def _record_types(
     from rematch.worker.task import Task
 
     assert isinstance(task, Task)
-    layout = measure(sandbox, task, body, types)
+    try:
+        layout = measure(sandbox, task, body, types)
+    except RuntimeError:  # the match is already recorded; its types just go unmeasured
+        return 0
     rows = 0
     with conn:
         for t in types:

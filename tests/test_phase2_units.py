@@ -387,8 +387,10 @@ def test_prompts_render() -> None:
         declarations="void sub_1(void);",
         ctx_kb=1000,
         learnings="(none)",
+        protos_allowed=["sub_1", "sub_2"],
     )
     assert "\tbx lr" in task and "void sub_1(void);" in task and "1000 KB" in task
+    assert "rematch:protos block may correct: sub_1, sub_2" in task
     assert "sub_1" in task and "every target version" in task and "draft.c" not in task
 
 

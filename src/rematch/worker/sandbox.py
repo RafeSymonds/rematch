@@ -19,11 +19,12 @@ from rematch.context.header_index import HeaderIndex
 from rematch.context.m2c import apply_prototype, m2c_asm, run_m2c
 from rematch.diff.match import function_view
 from rematch.diff.objdump_backend import Line, disassemble, run_objdump
+from rematch.integrate.headers import committed_headers, rewrite_includes
 from rematch.integrate.labels import LabelError, label_table
 from rematch.integrate.labels import pool_names as label_pool_names
 from rematch.inventory import asm_parser, link_order
 from rematch.inventory.c_parser import function_source, strip_comments, tu_local_context
-from rematch.learnings.rules import compiler_file, sandbox_text, target_file
+from rematch.learnings.rules import compiler_file, sandbox_text, selected_text, target_file
 from rematch.session import Session
 from rematch.target.definition import target_dir
 from rematch.toolchain.compile_db import CompileDB, CompileEntry
@@ -103,15 +104,46 @@ def context_stub(
             ln + "\n" for ln in tu_text.splitlines() if ln.lstrip().startswith("#include")
         )
     include_dirs = s.definition.source.include_dirs if s.definition.source else []
-    headers = ["global.h"]
+    found: list[str] = []
     if index is not None:
         # the target's own header first: a known prototype it must keep, then its callees'
         for name in [fn.name, *callees]:
-            for h in index.headers_for(name):
-                form = _include_form(h, include_dirs)
-                if form not in headers:
-                    headers.append(form)
-    return "".join(f'#include "{h}"\n' for h in headers)
+            found += index.headers_for(name)
+        root = committed_headers(s) or s.worktree
+        found = with_type_dependencies(list(dict.fromkeys(found)), index, root)
+    headers = ["global.h", *(_include_form(h, include_dirs) for h in found)]
+    return "".join(f'#include "{h}"\n' for h in dict.fromkeys(headers))
+
+
+_IDENT = re.compile(r"\b[A-Za-z_]\w*\b")
+
+
+def with_type_dependencies(
+    headers: list[str], index: HeaderIndex, root: Path, depth: int = 2
+) -> list[str]:
+    """`headers` (index paths), each preceded by the headers that define the types it uses
+    but doesn't define or include itself: real C files include those first, so a header may
+    rely on them, and its flattened context would not compile alone."""
+    out: list[str] = []
+    active: set[str] = set()
+
+    def add(h: str, level: int) -> None:
+        if h in out or h in active:
+            return
+        active.add(h)
+        path = root / h
+        if level < depth and path.is_file():
+            text = strip_comments(path.read_text(encoding="utf-8", errors="replace"))
+            for ident in dict.fromkeys(_IDENT.findall(text)):
+                where = index.type_headers(ident)
+                if where and h not in where and not any(w in out for w in where):
+                    add(where[0], level + 1)
+        active.discard(h)
+        out.append(h)
+
+    for h in headers:
+        add(h, 0)
+    return out
 
 
 def include_flags(entry: CompileEntry) -> list[str]:
@@ -132,10 +164,15 @@ def include_flags(entry: CompileEntry) -> list[str]:
 def make_context(s: Session, version: str, stub: Path, entry: CompileEntry) -> str:
     """Run the target's context command. `{includes}` expands to the TU's own -I flags."""
     ctx = s.definition.require(s.definition.context, "context")
+    flags = include_flags(entry)
+    headers = committed_headers(s)  # landed prototype overrides (SPEC §10)
+    if headers is not None:
+        dirs = s.definition.build_info.header_dirs if s.definition.build_info else []
+        flags = rewrite_includes(flags, entry.directory, s.worktree, headers, dirs)
     argv: list[str] = []
     for a in ctx.command:
         if a == "{includes}":
-            argv += include_flags(entry)
+            argv += flags
         else:
             argv.append(
                 a.format(target_dir=target_dir(s.settings.target_repo), version=version, input=stub)
@@ -274,6 +311,25 @@ def write_examples(s: Session, examples: tuple[FunctionRecord, ...], out: Path) 
     return names
 
 
+def asm_only(s: Session, names: list[str]) -> list[str]:
+    """The `names` that are assembly functions with no C definition yet: their header
+    prototypes may be placeholders, so a rematch:protos block may correct them."""
+    if not names or not s.db_path.is_file():
+        return []
+    conn = sqlite3.connect(f"file:{s.db_path}?mode=ro", uri=True, timeout=30)
+    try:
+        marks = ",".join("?" * len(names))
+        rows = conn.execute(
+            f"SELECT name FROM functions WHERE name IN ({marks}) AND source_kind = 'asm'"
+            " AND status != 'integrated'",
+            names,
+        ).fetchall()
+    finally:
+        conn.close()
+    found = {str(r[0]) for r in rows}
+    return [n for n in names if n in found]
+
+
 def build_sandbox(
     s: Session,
     fn: FunctionRecord,
@@ -356,6 +412,9 @@ def build_sandbox(
         functions=[symbol, *dict.fromkeys(n for n in names if n in called)],
         data=list(dict.fromkeys(n for n in names if n not in called)),
     )
+    protos_allowed = (
+        [] if opts.bench or fn.source_kind != "asm" else [symbol, *asm_only(s, sorted(called))]
+    )
     shown = FunctionRecord(
         fn.id, symbol, fn.address, fn.module, fn.tu_path, fn.source_kind, fn.mode, fn.version_cond
     )
@@ -393,13 +452,13 @@ def build_sandbox(
     check.chmod(0o755)
 
     example_names = write_examples(s, opts.examples, out)
-    learnings = sandbox_text(
-        [
-            compiler_file(s.definition.worker.compiler or "default"),
-            target_file(target_dir(s.settings.target_repo)),
-        ]
-    )
+    rule_files = [
+        compiler_file(s.definition.worker.compiler or "default"),
+        target_file(target_dir(s.settings.target_repo)),
+    ]
+    learnings = sandbox_text(rule_files)
     (out / "LEARNINGS.md").write_text(learnings, encoding="utf-8")
+    inline = selected_text(rule_files, target_s, s.settings.learnings_inline)
     if opts.task_md:
         (out / "TASK.md").write_text(
             prompts.render(
@@ -418,7 +477,8 @@ def build_sandbox(
                 target_s=target_s.rstrip("\n"),
                 declarations=decls,
                 ctx_kb=(out / "ctx.h").stat().st_size // 1024,
-                learnings=learnings.strip(),
+                learnings=inline,
+                protos_allowed=protos_allowed,
             ),
             encoding="utf-8",
         )
@@ -438,6 +498,7 @@ def build_sandbox(
         compile_timeout=s.settings.compile_timeout_sec,
         prologue=wrap[0],
         epilogue=wrap[1],
+        protos_allowed=protos_allowed,
     )
     task.save(control)
     return task

@@ -21,6 +21,7 @@ from pathlib import Path
 
 from rematch.diff.match import FunctionView, RelocEntry, Resolver, binary_match, function_view
 from rematch.diff.objdump_backend import describe_target, disassemble, run_objdump
+from rematch.integrate.headers import committed_headers, compile_spec
 from rematch.integrate.labels import Labels, label_table, name_at
 from rematch.integrate.piece import FunctionStatus, PieceResult, linked_offsets
 from rematch.session import Session
@@ -170,12 +171,13 @@ def prepare_data(s: Session, tu: str, functions: list[str], control: Path) -> Da
         s.settings.piece_compile_timeout_sec,
         s.settings.max_checks,
     )
+    headers = committed_headers(s)  # the functions' landed prototype overrides
     for version in s.target.versions():
         db = CompileDB.load(
             s.definition.build_dir(s.worktree, version) / build.compile_commands, s.worktree
         )
         entry = db.entry(tu)
-        spec.compile[version] = CompileSpec.of(db.c_template_for(tu)).model_dump()
+        spec.compile[version] = compile_spec(s, db.c_template_for(tu), headers)
         vobj = read_object(entry.object_path)
         labels = label_table(s, entry)
         lays = layouts(vobj)

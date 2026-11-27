@@ -176,3 +176,18 @@ def test_apply_decisions_verifies_and_scopes(
     assert (
         json.loads((tmp_path / "comp.json").read_text())["rules"][1]["evidence"]["expect"] == "lsl"
     )
+
+
+def test_task_md_gets_the_rules_closest_to_the_target() -> None:
+    from rematch.learnings.rules import Rule, RuleFile, selected_text
+
+    rules = [
+        Rule("C1", "A `switch` with dense cases emits a jump table (`add pc`).", None),  # type: ignore[arg-type]
+        Rule("C2", "Bitfield stores truncate with `lsls` then `lsrs`.", None),  # type: ignore[arg-type]
+        Rule("C3", "Loads of `s16` locals use `ldrsh`.", None),  # type: ignore[arg-type]
+    ]
+    f = RuleFile(Path("x.json"), "Compiler quirks", rules)
+    target = "push {r4, lr}\nldrsh r0, [r1, #2]\nadds r0, #1\npop {r4, pc}\n"
+    out = selected_text([f], target, 1)
+    assert out.startswith("- Loads of `s16` locals use `ldrsh`.")
+    assert "2 more rules in LEARNINGS.md" in out

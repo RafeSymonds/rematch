@@ -525,7 +525,7 @@ def integrate_cmd(
     conn = store.connect(s.db_path)
     try:
         if data:
-            tus = list(tu) or data_ready_tus(conn)
+            tus = list(tu) or data_ready_tus(conn, s)
         elif types:
             tus = list(tu) or converted_tus(conn)
         else:
@@ -620,34 +620,25 @@ def run_cmd(
             fconn.close()
 
     def integrate_ready() -> list[str]:
-        from rematch.integrate.run import converted_tus, data_ready_tus
+        from rematch.integrate.run import converted_tus, data_only_tus
 
         iconn = store.connect(s.db_path)
         try:
+            # one pool: new functions first, then finishing fully converted TUs (one type per
+            # object, then the data into C); the two TU sets are disjoint
+            jobs = [("functions", ready_tus(iconn))]
+            if finish:
+                jobs.append(("finish", converted_tus(iconn) + data_only_tus(s, iconn)))
             outcomes = integrate(
                 s,
                 iconn,
-                ready_tus(iconn),
+                [],
                 dry_run=False,
                 log=_echo_err,
                 fix=fixer if fix else None,
+                fix_data=data_fixer if fix else None,
+                steps=jobs,
             )
-            # finishing fully converted TUs: one type per object, then the data into C
-            if finish:
-                for step, tus in (
-                    ("types", converted_tus(iconn)),
-                    ("data", data_ready_tus(iconn)),
-                ):
-                    outcomes += integrate(
-                        s,
-                        iconn,
-                        tus,
-                        dry_run=False,
-                        log=_echo_err,
-                        fix=fixer if fix else None,
-                        step=step,
-                        fix_data=data_fixer if fix else None,
-                    )
         finally:
             iconn.close()
         for o in outcomes:

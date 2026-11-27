@@ -102,7 +102,13 @@ def run_tu_data(
     live = s.settings.live_worktree
     assert live is not None
     # start from the types step's source when it has one, so the data lands on merged types
-    source = stored_source(conn, tu, functions, "types") or (live / c_piece).read_text("utf-8")
+    source = stored_source(conn, tu, functions, "types")
+    if source is None and (live / c_piece).is_file():
+        source = (live / c_piece).read_text("utf-8")
+    if source is None:  # a data-only TU: start from the assembly file's own includes
+        asm_text = (live / asm_piece).read_text("utf-8")
+        includes = [ln for ln in asm_text.splitlines() if ln.startswith("#include")]
+        source = "\n".join(['#include "global.h"', *includes]) + "\n"
     run_id = start_run(conn, "live", run_config(s, model, effort, {"tu_data": tu}), None)
     with conn:
         cur = conn.execute(

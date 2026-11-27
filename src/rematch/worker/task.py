@@ -65,6 +65,9 @@ class Task(BaseModel):
     # the harness: workers may not write #pragma.
     prologue: str = ""
     epilogue: str = ""
+    # Functions a rematch:protos block may redeclare: the target and its assembly-only callees
+    # (SPEC §6.4). Their headers' prototypes may be placeholders.
+    protos_allowed: list[str] = []
 
     def save(self, sandbox: Path) -> None:
         (sandbox / TASK_FILE).write_text(self.model_dump_json(indent=2) + "\n", encoding="utf-8")

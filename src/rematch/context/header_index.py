@@ -36,6 +36,13 @@ class HeaderIndex:
     def headers_for(self, name: str) -> list[str]:
         return sorted({d.header for d in self._by_name.get(name, [])})
 
+    def type_headers(self, name: str) -> list[str]:
+        """Headers that define `name` as a type: typedefs first, then enum, struct and union
+        tags."""
+        rank = {"typedef": 0, "enum": 1, "struct": 2, "union": 3}
+        hits = [d for d in self._by_name.get(name, []) if d.kind in rank]
+        return list(dict.fromkeys(d.header for d in sorted(hits, key=lambda d: rank[d.kind])))
+
     def has_prototype(self, name: str) -> bool:
         return any(d.kind in FUNCTION_KINDS for d in self._by_name.get(name, []))
 

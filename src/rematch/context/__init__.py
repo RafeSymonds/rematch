@@ -8,4 +8,7 @@
 # 7: LEARNINGS = rematch's generic rules + the target's .rematch/LEARNINGS.md (Phase 3, B3).
 # 8: live asm targets: pool words named from the asm source, padding trimmed, extern-data note.
 # 9: live asm targets: ctx.h also includes the header that declares the target.
-CONTEXT_VERSION = 9
+# 10: TASK.md inlines the LEARNINGS_INLINE most relevant rules; LEARNINGS.md keeps all.
+# 11: context headers are preceded by the headers defining the types they use; ctx.h
+#     comes from rematch/live's committed headers (prototype overrides).
+CONTEXT_VERSION = 11

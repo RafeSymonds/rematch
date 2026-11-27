@@ -27,7 +27,7 @@ needs, and LEARNINGS.md. You don't need to open those files.
 - previous_best.c: the best earlier attempt ({{ previous_best_score }}%); ./check it to see its diff
 {% endif %}
 
-## LEARNINGS.md
+## Learnings (the most relevant to this function; LEARNINGS.md has every rule)
 
 {{ learnings }}
 
@@ -39,6 +39,10 @@ This function is checked against every target version.
 Data that target.s loads from its literal pool by name (`ldr rN, =NAME`) is defined in the
 assembly file, which stays as it is. Declare it `extern` with exactly that name and a fitting
 type; don't define it in candidate.c.
+{% endif %}
+
+{% if protos_allowed %}
+Prototypes a rematch:protos block may correct: {{ protos_allowed|join(", ") }}.
 {% endif %}
 
 Write the function {{ symbol }} in candidate.c, run ./check, iterate to MATCH.

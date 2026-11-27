@@ -11,6 +11,7 @@ import pytest
 
 from rematch.db import store
 from rematch.integrate import run as R
+from rematch.integrate.linkspec import WRITERS
 from tests.helpers import git
 
 LINK = "link.txt"
@@ -125,12 +126,15 @@ def test_journal_replay_cleans_a_killed_batch(env: Any) -> None:
     assert not (env.s.settings.rematch_var / "integrate.journal").exists()
 
 
-def test_last_failed_hash(env: Any) -> None:
+def test_failed_before_sees_failures_behind_later_rows(env: Any) -> None:
     plan = prepared("a").plan
-    R._record(env.conn, plan, "failed", None, "x", "h1")
-    assert R.last_failed_hash(env.conn, "asm/a.s") == "h1"
+    R._record(env.conn, plan, "failed", None, "data", "h-data")
+    R._record(env.conn, plan, "failed", None, "types", "h-types")  # the other step, later
+    assert R.failed_before(env.conn, "asm/a.s", "h-data")
+    assert R.failed_before(env.conn, "asm/a.s", "h-types")
     R._record(env.conn, plan, "committed", "abc", "y", "h2")
-    assert R.last_failed_hash(env.conn, "asm/a.s") is None
+    assert not R.failed_before(env.conn, "asm/a.s", "h2")
+    assert not R.failed_before(env.conn, "asm/b.s", "h-data")
 
 
 def test_culprit_needs_a_unique_name() -> None:
@@ -148,3 +152,66 @@ def test_a_step_that_rewrites_one_piece_keeps_the_others(env: Any) -> None:
     R._land(env.s, env.conn, env.live, LINK, writer, [step], out, print)
     assert out[0].status == "committed"
     assert (env.live / "asm" / "a.s").is_file()
+
+
+def test_steps_share_one_pool_and_finish_falls_through_to_data(
+    env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def fn_step(_s: Any, _c: Any, tu: str, **_k: Any) -> Any:
+        calls.append(("functions", tu))
+        return prepared(tu[4:5])
+
+    def types_step(_s: Any, _c: Any, tu: str, **_k: Any) -> Any:
+        calls.append(("types", tu))
+        if tu == "asm/b.s":
+            return prepared("b")  # types land; data waits for the next cycle
+        return R.Outcome(tu, "skipped", "types already merged")
+
+    def data_step(_s: Any, _c: Any, tu: str, **_k: Any) -> Any:
+        calls.append(("data", tu))
+        return prepared(tu[4:5])
+
+    monkeypatch.setattr(R, "prepare_tu", fn_step)
+    monkeypatch.setattr(R, "prepare_types_tu", types_step)
+    monkeypatch.setattr(R, "prepare_data_tu", data_step)
+    monkeypatch.setattr(R, "live_worktree", lambda _s: env.live)
+    monkeypatch.setitem(WRITERS, "test", writer)
+    monkeypatch.setitem(R._batch, "size", R.BATCH_START)
+    link = SimpleNamespace(format="test", file=LINK)
+    env.s.definition = SimpleNamespace(
+        asm=SimpleNamespace(format="pret-macros"), link_order=link, require=lambda v, _n: v
+    )
+    env.s.settings.integrate_workers = 2
+    env.s.db_path = env.s.settings.rematch_var / "db.sqlite"
+    out = R.integrate(
+        env.s,
+        env.conn,
+        [],
+        dry_run=False,
+        log=lambda _m: None,
+        steps=[("functions", ["asm/a.s"]), ("finish", ["asm/b.s", "asm/c.s"])],
+    )
+    assert sorted(calls) == [
+        ("data", "asm/c.s"),
+        ("functions", "asm/a.s"),
+        ("types", "asm/b.s"),
+        ("types", "asm/c.s"),
+    ]
+    assert sorted(o.tu for o in out if o.status == "committed") == ["asm/a.s", "asm/b.s", "asm/c.s"]
+    assert len(env.builds) == 1  # one batch, one build
+
+
+def test_landing_applies_prototype_overrides_to_live_headers(env: Any) -> None:
+    (env.live / "include").mkdir()
+    (env.live / "include" / "x.h").write_text("// x\nvoid f(void);\nint g(void);\n")
+    git(env.live, "add", "-A")
+    git(env.live, "commit", "-q", "-m", "header")
+    env.s.definition = SimpleNamespace(build_info=SimpleNamespace(header_dirs=["include"]))
+    p = prepared("a")
+    p.overrides = {"f": "BOOL f(u16 a);"}
+    out: list[R.Outcome] = []
+    assert R._land(env.s, env.conn, env.live, LINK, writer, [p], out, print)  # type: ignore[arg-type]
+    assert (env.live / "include" / "x.h").read_text() == "// x\nBOOL f(u16 a);\nint g(void);\n"
+    assert "include/x.h" in git(env.live, "show", "--name-only", "--format=", "HEAD")

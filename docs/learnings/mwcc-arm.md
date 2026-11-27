@@ -1,27 +1,25 @@
 # Compiler quirks: mwcc-arm
 
 - In a sparse switch, an explicit case sharing the default body (`case 100: default:`) still emits its own compare (`cmp r0, #100`) before the branch to that body, while a bare `default:` does not.
-- A value computed from locals (`int n = (a + b) / 32; h(); k(n);`) can have its computation delayed past an intervening call, while writing the calls inside the expression (`int n = (g() + g()) / 32;`) finishes computing it right after them.
 - A literal-pool operand shown as `<str:"">` that is loaded and then dereferenced can be a file-local variable: `static T *p;` produces it, while `extern T *p;` shows the symbol name.
 - `S l = *(const S *)&sym;` (S wraps an array) copies like a local array initializer `int l[6] = {...};`, but the literal pool names `sym` instead of anonymous data.
 - `if (a() || b() || !c()) return 0;` shares one return block (`bne` to it), while separate `if (a()) return 0;` statements each emit their own return.
-- Passing an `int` local to a `u8` parameter truncates at the call (`lsls #24; lsrs #24`), while a `u8` local (`u8 x = h();`) is truncated at assignment and passed with a plain move.
+- Passing an `int`, `u32` (including a direct `u32` call result, `f(g())`) or enum value, also through a `static inline` wrapper with `u16` parameters, to a narrow parameter truncates at the call (`lsls; lsrs` for `u8`/`u16`, `lsls #24; asrs #24` for `s8`), even if a local was assigned from a `u8` function, while a narrow local (`u8 x = h();`) or a directly passed narrow call result adds none, so a missing pair suggests the prototype's types are wrong.
 - An unreferenced `static` function is not emitted; any reference, such as `return (void *)f;` or a non-static `void (*ref)(int *) = f;`, makes the compiler emit it.
 - `V v = {0, 0, 0};` stores through a base register (`add r0, sp, #N; str r1, [r0, #4]`), while `v.x = 0; v.y = 0; v.z = 0;` stores sp-relative.
 - In array loops, `T *p = &arr[i]; p->a = src[i];` instead of repeated `arr[i].a = src[i];` can swap the registers holding the strength-reduced pointers.
-- A large local initializer such as `u16 a[41] = {1, 2};` copies anonymous rodata (`<data:SIZE:HASH>`, so every value must be exact) with a count-down `ldrh`/`strh` loop, unlike a hand-written copy loop from a named table.
-- `if (x == 3 || x == 4)` folds to a range check (`subs #3; cmp #1; bhi`), while `switch (x) { case 3: case 4: }` emits separate `cmp`/branch pairs.
-- `d->sub.arr[i] = x;` adds the member offset on every store, while `Sub *s = &d->sub; s->arr[i] = x;` adds the struct offset once and puts the array offset in the `strb` immediate.
-- If a loop counter and a strength-reduced pointer have swapped callee-saved registers, try separate counters per loop (`i`, `j`) instead of reusing one.
+- `if (x == 3 || x == 4)` folds adjacent values to a range check (`subs #3; cmp #1; bhi`), while `switch (x) { case 3: case 4: }` and a negated guard (`if (x != 0xfd && x != 0xfa && x != 0xfb) return 0;`) keep separate `cmp`/branch pairs.
+- `d->sub.arr[i]` can keep the member offset in each load or store, while going through a pointer (`Sub *s = &d->sub; s->arr[i]`) adds the struct offset to the base once, also for the strength-reduced pointer in a loop.
+- If a loop counter, other locals or spill slots differ in registers or offsets, try both separate counters per loop (`i`, `j`) and one reused counter.
 - Storing -1 in a loop `a[i] = -1;` emits `subs r0, r1, #1` (from a zero register) for an `s8` array but `movs r0, #255` for a `u8` array.
-- With an `s16 i`, `i < NELEMS(arr)` compares unsigned (`bcc`), while `i < 60` compares signed (`blt`).
+- With an `s16 i`, `i < NELEMS(arr)` compares unsigned (`bcc`), while `i < (int)NELEMS(arr)` or `i < 60` compares signed (`blt`).
 - `(g(0) + g(1)) / 2` with `u32` returns divides unsigned (`lsrs #1`), while `(int)(g(0) + g(1)) / 2` emits the signed `lsrs #31; adds; asrs #1`.
-- `x = x - 7; k(x, ...);` on a `u16` local does the subtract before setting up stack arguments, while `k((u16)(x - 7), ...);` schedules it among them.
+- Computing a value in its own statement does it before stack arguments are set up (`x = x - 7; k(x, ...);` on a `u16`, or `int p = f(x) + 1; g(..., p);`), while writing the expression in the argument list schedules it among the argument setup.
 - `for (i = 0; tbl[i] != 0xFFFF; i++)` over an extern table emits an entry check before the loop, while `do { ... i++; } while (tbl[i] != 0xFFFF);` does not.
 - A NULL test on a value just copied with `adds rN, rM, #0` needs no `cmp`: `if (p != NULL)` branches on the copy's flags, while `if (p != (int *)4)` emits `cmp rN, #4`.
 - `arr[i].a = 0;` in a loop is strength-reduced to a pointer stepped by the element size (`adds r3, #3`), unlike manual byte offsets `*((u8 *)arr + i * 3)`, so write plain indexing.
-- `A a = f();` for a returned struct builds it in a temporary and then copies it, while `A a; a = f();` can drop the copy when only a member is then read.
-- Assigning an all-zero compound literal `s->v = (V){0, 0, 0};` stores zeros with `str`, while a non-zero one `(V){1, 2, 3}` copies from anonymous rodata (`ldr rN, =<data:...>`).
+- `A a = f();` for a returned struct (also in a mid-function block) builds it in a temporary and then copies it, while `A a; a = f();` can drop the copy, even when `&a` is then passed to a call.
+- Assigning a compound literal `s->v = (V){0, 0, 0};` builds the zeros in a stack temporary and then copies them (large structs use loops), a non-zero `(V){1, 2, 3}` copies from anonymous rodata (`ldr rN, =<data:...>`), and member assignments store directly.
 - A constant aggregate initializer inside a loop body (`for (...) { V s = {4096, 4096, 4096}; g(&s); }`) is loaded into a hidden temporary once before the loop body and copied from it into `s` every iteration, so an early copy can belong to a loop-body local.
 - Declaration order can set the stack slots of spilled scalar locals: with both spilled, `int a; int b;` put `a` above `b`, and `int b; int a;` swapped them.
 - A jump-table switch lays out case bodies in source order (writing `case 3:` before `case 0:` moves its body first), so order the C cases by body address after decoding the table.
@@ -29,6 +27,123 @@
 - Comparison constants are kept as written: `x < 8` emits `cmp #8; bge`, while `x <= 7` emits `cmp #7; bgt`.
 - Assigning an int expression to a narrow local truncates at the assignment (`u16 v = x + 3;` adds `lsls #16; lsrs #16`, `u8` uses #24, even if the value already fits), while `int v` does not.
 - Parentheses control constant arithmetic order: `a + b - 5` adds then subtracts, while `a + (b - 5)` subtracts from `b` first.
-- Operand order of a multiply can set load order: `s->a * s->b` loads `a` first and `s->b * s->a` loads `b` first.
-- Address-taken locals of one block (scalars, arrays, structs) are placed by declaration order, the earlier declared at the higher stack address: `T t; int ids[6];` puts `ids` below `t`.
+- Operand order of `*` or `|` can set load order: `s->a * s->b` loads `a` first and `s->b * s->a` loads `b` first, and `(p[1] << 16) | p[0]` loads `p[1]` first while `p[0] | (p[1] << 16)` loads `p[0]` first.
+- Address-taken locals of one block (word scalars, arrays, structs) are placed by declaration order, the earlier declared at the higher stack address: `T t; int ids[6];` puts `ids` below `t`.
 - Local declaration order affects which register each local gets (and can decide which one is spilled): `int i; int *r = NULL;` versus `int *r = NULL; int i;` swaps r4/r5.
+- An all-zero local array initializer (`u16 t[41] = {0};`) zero-fills in a loop from `movs r0, #0`, while a non-zero one (`u16 a[41] = {1, 2};`) copies anonymous rodata (`<data:SIZE:HASH>`, so every value must be exact) with a count-down `ldrh`/`strh` loop, unlike a hand-written copy from a named table.
+- `return 1;` inside each switch case emits a separate return per case, while `r = 1; break;` with one final `return r;` branches to a shared exit and moves the value from a register.
+- After `for (i = 0; i < 6; i++)` with `u32 i`, repeated `k(i + 14);` calls can compute `i + 14` once into the counter's register, while `int i` with `(u32)i < 6` recomputes it at earlier calls (`adds r0, r4, #0; adds r0, #14`).
+- Calls in the initializer of an unused local are still emitted, right operand first: `int d = g(x) + g(z);` with `d` unused calls `g(z)` before `g(x)`, while using `d` calls `g(x)` first.
+- `if (g() == 0) s->a = 1; else s->a = 0; s->b = 2;` with large member offsets loads b's offset from the literal pool (`ldr r0, =0x408`), while `s->a = g() == 0; s->b = 2;` derives it from a's offset (`adds r0, r0, #4`).
+- A `switch` on a `u32` orders its compares as unsigned (negative cases such as `case -2:` sort last, branches use `bhi`/`bcs`), while an `int` switch sorts them first and uses `bgt`/`bge`.
+- A constant address plus a constant offset (`((S *)0x027E0000)->x |= 1;` or `*(vu32 *)(0x027E0000 + 0x3FF8) |= 1;`) folds into one literal, while a local pointer (`S *p = (S *)0x027E0000; p->x |= 1;` or `p[0x3FF8 / 4] |= 1;`) keeps separate base and offset literals.
+- A `u16` stack parameter stored to a 32-bit field (`s->v = d;`) loads with `add rN, sp; ldrh` and an `s16` one is read with `add rN, sp; ldrsh`, while a `u32` or `int` parameter (also an `int` stored to an `s16`) uses `ldr rN, [sp, #X]`, so a bare `ldr` suggests the prototype does not declare the parameter narrow.
+- Assigning an `int` to a `u8` or `u16` bitfield (`s->b = x;`, also `u16 b : 15`) truncates first (`lsls; lsrs` by 24 or 16 before the field insert), while a value already of that type does not.
+- Field loads passed to a `static inline` helper follow the order of its body expression, not its parameters: with `add(s->a, s->b)`, `return y + x;` loads `b` first and `return x + y;` loads `a` first.
+- A `u16` local or register parameter is trusted as already zero-extended (`f(v)` to a `u32` parameter, or `g = a;` with `int g`, adds no shifts), while `int v = (u16)g(); f((u16)v);` truncates both at the assignment and at the call, and storing `(u16)a` of an `int a` emits `lsls #16; lsrs #16`.
+- `adds r0, rN, #0` just before the final `pop {..., pc}` is a return value: `int t(int a) { k(0); k(0); return a; }` emits it, while the `void` version does not even keep `a`, so a `void` prototype there is wrong.
+- A plain `static` function is not auto-inlined even with a single call site (the caller emits a call such as `ldr r3, =s; bx r3`), while `static inline` expands its body into the caller.
+- `b--; k(a, b); k(a, b);` on a parameter can keep the original value in a register and recompute `b - 1` at each use (`subs r1, r4, #1` twice), while `int c = b - 1;` computes it once into a register.
+- In `f(g(p->a->b), p->a->c);` the pointer `p->a` is loaded before the call to `g` and kept in a callee-saved register, while `int x = g(p->a->b); f(x, p->a->c);` reloads it after the call.
+- Two reads `tb[i][v]; ... tb[j][v];` with `int v` can share one scaled `v * 2` across an intervening call, while writing one index as `(u32)v` makes each read compute it separately.
+- In a loop, mixing a walking pointer with indexing (`T *p = arr; for (i = 0; i < 4; i++, p++) k(&p->a, arr[i].b);`) keeps two pointers to the same element (`adds r5, r4, #0`) where plain `arr[i]` keeps one, and `i++, p++` versus `p++, i++` can swap the order of the two pointer increments.
+- An initialized declaration in a nested block initializes at that point: `h(); { V v = {0, 0, 0}; g(&v); }` emits the zero stores after the call to `h`, while declaring `v` before `h();` stores them before it.
+- `do { k(); } while (--n > 0);` ends in `subs; bne` for `u32 n` but `subs; cmp #0; bgt` for `int n` (plain `while (--n)` on a parameter gives the same code for both), and with a constant start (`int i = 16; do { *p++ = 0; } while (--i != 0);`) an `int` counter still emits `cmp #0; bgt` plus an extra `subs` before the store, unlike `u32`.
+- `u16 d = a - b; r = d * s / t;` can truncate into another register and copy it (`lsrs r1, r0, #16; adds r0, r1, #0`) and load the global `t` afterwards, while inline `(u16)(a - b) * s / t` truncates in place and can load `t`'s address earlier.
+- A constant index or member offset on an extern array folds into one pool literal (`&t[0xFFE]` gives `=t+0x3ff8`), while integer arithmetic `*(vu32 *)((u32)t + 0x3FF8)` keeps `=t` and the offset separate, so match whichever form the pool shows.
+- `int *p = d->m; V v = {0, 0, 0}; g(&v, p);` loads `d->m` before the zero stores, while `V v = {0, 0, 0}; g(&v, d->m);` loads it after them.
+- A chained `p = s->x = f();` stores the result from r0 before copying it (`str r0, [..]; adds rN, r0, #0`), while `p = f(); s->x = p;` copies to p's register first and stores from there.
+- Invariant work written inside a loop body (`d[i] = val; d[i + 1] = -val;` with `int val` and `u16 *d`) is hoisted to after `i = 0` and the entry check, while locals assigned before the loop (`u16 a = val, b = -val;`) are computed before them.
+- Splitting a calculation into locals (`int c = w() / 2; int x = c - g() / 2;`) finishes the first part before calling `g`, while one expression (`w() / 2 - g() / 2`, or `f(a + g() * s->k, b + h() * s->m)`) can delay part of the earlier operand's division, load or multiply until after the later call.
+- In a loop, passing `&arr[i]` to a `const T *` parameter while also reading `arr[i].b` can keep two strength-reduced pointers (`adds r5, r4, #0`), while a `T *` parameter shares one.
+- Zeroing bitfields one by one (`s->b = 0; s->c = 0;` on `u32 b : 1; u32 c : 31;`) keeps a load, `bics`, `ands` and store, while `*(u32 *)s = 0;` just stores zero.
+- Assigning a struct of `s16` members (`*d = s->v;`) copies with `ldrh`/`strh`, while member-by-member copies (`d->x = s->v.x;`) can load with `ldrsh` and a register offset.
+- In a loop over an extern table, 2D indexing `m[i][0], m[i][1]` steps one pointer by the row size (`adds r5, #16`), while flat `m[i * 4], m[i * 4 + 1]` can rescale an index and add the base on each iteration.
+- Reassigning a parameter (`size = total - size;`) instead of using a new local (`int r = total - size;`) can swap which callee-saved registers the values get.
+- In a search loop with `return p;`, declaring the counter before the pointer (`u32 i = s->count; T *p = s->arr;`) can keep `p` in r0, while declaring `p` first puts it in another register and adds `adds r0, r2, #0; bx lr`.
+- A non-void function with an early `return` but no final one leaves r0 unset on the final path, while adding `return 0;` at the end emits `movs r0, #0` before the `pop`.
+- Struct assignment (`*d = *s;`) of bytes or halfwords copies with a count-down `ldrb`/`strb` or `ldrh`/`strh` loop (`struct { u16 a; u8 b, c; }` gives two `ldrh`/`strh` pairs, so this does not prove a second `u16` field), while word structs use `ldmia`/`stmia` (a 0x24-byte one loops 4 times over 8 bytes plus a trailing `ldr`/`str`).
+- A local pointer assigned before earlier calls (`p = tbl; h(); for (...) k(p[i]);`) loads the table's literal address into a callee-saved register before those calls, while indexing `tbl[i]` directly loads it after the loop's entry check.
+- After a call, `if (!f()) return 5; return 9;` branches with `beq` and places `return 9` first, while `if (f() == 0) return 5; return 9;` branches with `bne` and places `return 5` first.
+- An empty case beyond the last case with a body (`case 7: break;` after cases 0-4) raises a jump table's bound (`cmp r0, #7` instead of `#4`) and lengthens the table.
+- `int o = 0; o += x * 8;` keeps the zero in a register and emits an `adds` with it, while `int o = x * 8;` emits only the shift.
+- Taking the address of a by-value parameter that arrives in registers (a struct `k(&v)`, or a scalar such as the 4th argument `k(&d)`) adds a `push {r0, r1, r2, r3}` prologue and returns with `pop {r3}; add sp, #16; bx r3`.
+- `u8` and `u16` values promote to signed `int`, so `x >> 3` emits `asrs` while `x / 8u` (or `(u32)x >> 3`) emits `lsrs`, `x / 2` emits a bare `lsrs #1` with no sign correction, and `v * 4096 + 0.5f` converts a `u16 v` with `_fflt` but a `u32 v` with `_ffltu`.
+- In `return arr[i] + n;` (or `n + arr[i]`) the non-loaded value is the first addend (`adds r0, r2, r0`), while `int x = arr[i]; x += n;` puts the loaded value first (`adds r0, r0, r2`).
+- Arguments occupy r0-r3 by position: passed-through parameters emit no `mov` but keep their registers busy (`*g = 1; f(a);` uses r1/r2, `*g = 1; f();` r0/r1), a table call that does its lookup in r2/r3 or a call result moved to r1 before a `bl` suggests the callee takes that argument, and `ldr r0, [r3]` with r3 never set means the pointer is the 4th parameter.
+- On a `u16 *p`, `p++; n = *p++;` (or `n = *++p; p++;`) computes the address first (`adds r0, r5, #2; ldrh r0, [r0, #0]`), while `n = p[1]; p += 2;` uses `ldrh r0, [r5, #2]`.
+- `for (i = 0, total = 0; ...)` versus `int total = 0; for (i = 0; ...)` changes which variable gets `movs #0` (the other copies it) and can swap their registers or those of a strength-reduced pointer.
+- `int n = 10;` before a loop is folded into immediates, while assigning `n = 10;` in both branches of a preceding `if`/`else` keeps `n` in a register (`cmp r4, r5` in the loop test).
+- `ret = 7; switch (f())` sets the default before the call in a callee-saved register, while `int v = f(); ret = 7; switch (v)` sets it after the call and can keep `ret` in a scratch register such as r1.
+- In a `static inline` helper with a loop, indexing a pointer parameter directly (`p[i]`, passed `s->arr` at a large offset) can keep the offset in a register (`ldr r0, [r5, r6]`), while copying it to a local first (`u32 *data = p; data[i]`) computes the base pointer once (`ldr r0, [r5, #0]`).
+- With a signed `int x`, `arr[x & 0x7F]` (4-byte elements) emits just `lsls #25; lsrs #23`, while `arr[x % 128]` emits a signed remainder using `rors`.
+- With a call inline, `k(0, f() + x)` and `k(0, x + f())` both put `x` first (`adds r1, r4, r1`), while after `int v = f();` writing `v + x` puts the call result first (`adds r1, r1, r4`).
+- A global's halfword member past the Thumb immediate range splits between literal and offset (`extern S g; return g.f;` with `u16 f` at 0x58 emits `ldr r0, =g+0x40; ldrh r0, [r0, #24]`), so plain member access matches a `sym+0x40` literal.
+- `if (a == s->x) s->x = c - 1; else s->x--;` emits a separate subtract and store in each branch, while `s->x = (a == s->x ? c : s->x) - 1;` selects the value first and shares one `subs`/`str`.
+- `memset(p, 0, 8);` is not expanded inline and compiles to a call, unlike `p[0] = 0; p[1] = 0;`.
+- Repeated soft-float expressions are recomputed (`k((int)(a * a), (int)(a * a));` calls `_fmul` twice, also when a macro repeats its argument), while `float s = a * a;` computes it once.
+- Statement order sets load order separately from declaration order: `int *p; int n = s->n; p = s->a;` loads `n` first, while `int *p = s->a; int n = s->n;` loads `p` first.
+- Returning a `u32` value from a `u8` function (`u8 t(S *s) { return s->f; }`) adds `lsls #24; lsrs #24`, so a bare `ldr r0` before the return suggests a wider return type.
+- `f(p[0], p[1])` loads both with `adds r1, r0, #0; ldmia r1, {r0, r1}` when `p` is not used afterwards, but with two `ldr` when it is (`f(p[0], p[1]); k(p);`), so this `ldmia` does not imply a by-value struct argument.
+- In nested loops, `next = i + 1;` in the outer body followed by `m[next][j]` computes that row's address from `next * rowsize` with its own pointer, while writing `m[i + 1][j]` can reuse the `m[i]` pointer with a constant offset.
+- A narrow truncation merges with index scaling: `u8 i = x * 2; k(tb[i]);` on a `u16` array emits `lsls #25; lsrs #23`, while `int i = x * 2;` emits only `lsls #2`.
+- An address-taken `u8` or `u16` scalar can be placed below a `u16` array in either declaration order (`u8 a; u16 b[4];`), while declaring it as an array (`u8 a[4];`) makes declaration order apply (earlier is higher).
+- `int v = (u8)f(); u16 x = v;` emits both truncations (`#24` pair then `#16` pair), while `u16 x = (u8)f();` emits only the `#24` pair.
+- In soft-float double math, `x = x * 0.5;` passes the constant as the first `_dmul` operand (r0:r1), while compound `x *= 0.5;` passes the variable first.
+- A returned struct takes a hidden destination pointer in r0 (arguments shift to r1-r3): `V f(int x, int y, int z) { V v; v.x = x; ...; return v; }` builds `v` on the stack (`str r1, [sp, #0]`) and copies it to `*r0`.
+- `s->a = 1000; v = s->a >> 7; s->b = 0;` reuses the stored register and still emits the shift, while reading `s->a >> 7` after `s->b = 0;` reloads the field (`ldr`).
+- With `extern T *g[];`, `g[0]->x = 1; g[0]->y = 2;` keeps the pointer in a register, while a scalar `extern T *g;` reloads it after the store (`ldr r0, [r0, #0]`), so use a local (`T *p = g;`) where the target keeps a scalar global cached.
+- `E *p = &s->arr[i]; p->a = x; p->b = y;` adds the array's offset to `s` first and stores `a` as `str r2, [r0, r1]`, while `s->arr[i].a = x; s->arr[i].b = y;` adds `s + i * size` and puts the array offset in each store.
+- Passing `*(u64 *)p` by value loads straight from p's register (`ldmia r1, {r0, r1}`), while passing an 8-byte struct `*p` copies the pointer first (`adds r2, r1, #0; ldmia r2!, {r0, r1}`).
+- A `u32` bitfield read extracts with a shift pair (`lsls; lsrs`, as does `(x << 1) >> 31`), while mask code such as `(v & 0x1C000000) >> 26` keeps the mask (`ands` or `tst`).
+- `((u16)a << 3) + ((u16)b << 3)` is factored into one shift after the add, while applying `static inline u32 f(u32 k) { return (u16)k << 3; }` to each operand keeps two shifts (`lsrs #13`).
+- `p->d = p->a * p->b / p->c + p->e;` (either operand order) emits `adds r0, r1, r0` with the loaded `e` first, while `int v = p->a * p->b / p->c; p->d = v + p->e;` emits `adds r0, r0, r1`.
+- A cast in a loop body (`a[i] = (u8)x;`) is hoisted with `movs` for `i = 0` between its `lsls` and `lsrs`, while `u8 v = x;` before the loop keeps the pair adjacent.
+- A `u8`, `s8` or `u16` stack parameter can be read through a negative literal (`ldr rN, =0xfffffff0; add rN, sp; ldrb`, `ldrsb` or `ldrh`) from a plain store, while an `int` parameter stored to a narrow field uses `ldr rN, [sp, #X]`; `*(u8 *)&e` or `*(u16 *)&e` on a 32-bit parameter also gives the narrow read, unlike the cast `(u16)e`.
+- A low mask followed by a left shift merges into one shift pair (`int v = (s->f & 0xF) << 12;` on a `u8` field emits `lsls #28; lsrs #16`), while shifting a `u8 f : 4` bitfield (`s->f << 12`) extracts first and then shifts (`lsls #28; lsrs #28; lsls #12`).
+- `s->f == 1 || s->f == 2` on a `u8` field range-checks with a byte truncation (`adds #255; lsls #24; lsrs #24; cmp #1`), while `int v = s->f; if (v == 1 || v == 2)` emits a plain `subs #1; cmp #1`.
+- Taking a local's address anywhere in a function keeps it on the stack everywhere, so a loop counter that is stored and reloaded each iteration may be the same `int i` passed as `g(&i)` in another branch (`for (i = 0; i < 8; i++) k(i); ... else g(&i);`), while using a separate variable there leaves `i` in a register.
+- A separately incremented index (`idx = base; for (...) { k(&arr[idx]); idx++; }`) can be strength-reduced to a preheader multiply and a pointer stepped by the element size, while `int idx = base + i;` inside the loop multiplies on every iteration.
+- A constant that is both stored and passed to the next call can be stored from its argument register with no extra `mov`: `p->a[50] = 0; f(p, 0);` stores from r1, while `p->a[50] = 0; f(p);` stores from r2, so swapped registers can mean a missing argument.
+- With `u32 size`, a count-down `for (size = 64; size != 0; size--) *p++ = 0;` uses only the counter, while `while (size--)` adds an extra copy of the counter and a `cmp`.
+- The order of constant stores to a stack struct changes how constants are built: `s.vram = 0; s.pal = -1;` derives -1 from the zero (`subs r1, r0, #1`), while `s.pal = -1; s.vram = 0;` builds it with `movs r1, #0; mvns r1, r1`.
+- `i = 31; f(&p->arr[i]);` adds the array's member offset and the scaled index separately (`adds r0, #64`), while `f(&p->arr[31]);` folds them into one constant.
+- With a stack-argument pointer after a call, `*p = r ? 1 : 0;` under a NULL test loads `p` into a scratch register and reloads it at a single `strb`, while `if (r) *p = 1; else *p = 0;` loads `p` once into a callee-saved register before the call.
+- After `if (!a()) return 0;`, ending with `return b();` branches with `beq` and places `b()` first, while `ret = b(); return ret;` branches with `bne` and places the `return 0` block first.
+- With a call inline in a comparison (`f() == x` with a parameter, or `f() != s->x` with a `u16` field, in either operand order) the other value is the first `cmp` operand (`cmp r4, r0`), while `int v = f(); if (v == x)` emits `cmp r0, r4`.
+- Masking the result of a `static inline u8` helper again (`low(x) & 0xFF`, where `low` returns `x & 0xFF`) emits two `lsls #24; lsrs #24` pairs, while `low(x)` alone emits one.
+- A stack parameter stored by a loop into an array of differing signedness (`u32 v` into `int *d`) is loaded after the loop's entry check, while an `int v` is loaded into a callee-saved register at function entry.
+- Passing `(u8)x` of an `int` local to an `int` parameter can split the truncation around the setup of other arguments (`lsls` early, `lsrs` just before the call), while a `u8 x` local emits both shifts at the assignment.
+- A left-associative sum of calls `f(x) + f(2) + f(3) + f(4)` calls the later terms first (4, 3, then x, 2), while the right-nested `f(x) + (f(2) + (f(3) + f(4)))` calls them left to right.
+- With `u16 base`, a loop's `int index = base + i;` can become its own stepped register (`adds r5, r5, #1`), while `int base` recomputes `base + i` with an `adds` on every iteration.
+- With `for (i = 1; ...)`, `X[i - 1]` is strength-reduced to a pointer to `X[i]` (literal `=X+0x4`) with the offset subtracted at the use (`subs r0, r5, #4`), so such a literal need not mean the source indexes `X[i]`.
+- References to an `extern S g;` (`&g`, `g.x`, a local `S *p = &g`) share one literal-pool word, while a `static S g;` can add a second, section-relative pool word (`<str:"">`) for field reads.
+- `k(100 - i * 24)` in a loop is strength-reduced to an upward-stepped offset (`adds r5, #24`) subtracted from the constant, so a value the target decrements each pass (`subs r5, #24`) comes from a running local (`k(y); y -= 24;`).
+- An enum local passed to `int` parameters (`enum E x = A4; k(x);`) stays in a callee-saved register that can also build related constants (`lsls r0, r4, #17` for `0x80000`), while an `int x = 4;` local, or an enum local passed only to parameters of its own enum type, is propagated as an immediate.
+- Copying a two-word struct through a pointer (`g = *s;`) loads both words before storing, while member copies (`g.a = s->a; g.b = s->b;`) can interleave each `ldr` and `str`.
+- A Thumb word load immediate reaches only 0x7C, so an `int` member at 0x80 (`return s->b;`) compiles to `adds r0, #128; ldr r0, [r0, #0]`, while one at 0x7C is a single `ldr`.
+- With a global struct pointer and a large member offset, `g->arr[i]` adds `i` to the pointer and loads with the offset in a register, while `((u8 *)g)[i + 0x39C]` adds `i` to the offset first.
+- A `u8` function that ends by calling an `int` function without `return` (`u8 t(void) { g(); }`) can tail call (`bx r3`), while `return g();` pushes, calls and truncates with `lsls #24; lsrs #24`.
+- For an extern struct's array, `E *p = &g.arr[i]; k(p->b); k(p->c);` folds the array offset into one literal (`=g+0xc`) and uses immediate member offsets, while `g.arr[i].b` and `g.arr[i].c` can load a separate literal per member (`=g+0xe`, `=g+0x10`) and index with a register.
+- Comparing a `u8` or `u16` value with a constant (`a < 5`) or two `u16` fields (`s->a < s->b`) branches unsigned (`bcs`), while going through `int` locals or `int` inline parameters branches signed (`bge`).
+- A local used inside a loop (`k(n + i)`) and again after it can win a callee-saved register, while a separate running index (`int j = n; ... k(j); j++;`) can leave `n` spilled to the stack.
+- A chained `d->b = d->a = s->src;` loads `src` once and stores `a` then `b`, while `d->a = s->src; d->b = s->src;` reloads it after the first store.
+- Calling a function through a cast to another prototype (`void f(void); ((void (*)(int, void *))f)(5, p);`) still emits a direct `bl f`, with the arguments loaded into r0/r1.
+- In a loop, byte reads through a cast (`((u8 *)&s->word)[i]`) can step a separate pointer (`adds r5, r5, #1`), while a real `u8 arr[4]` member `s->arr[i]` adds base and index each pass (`adds r0, r5, r4; ldrb r0, [r0, #16]`).
+- Struct locals declared in sibling blocks (`if (c) { V v; ... } else { V v; ... }`) get separate stack slots even with the same name, while one function-scope `V v;` used by both branches gives a smaller frame.
+- A loop's direction follows the source: `for (i = 16; i != 0; i--) *p++ = 0;` with `u32 i` ends in `subs; bne`, while `for (i = 0; i < 16; i++)` stays count-up (`cmp #16; bcc`).
+- A narrowing cast merges with a constant multiply: with `u8 f(void)`, `k((u8)(f() * 8))` emits `lsls #27; lsrs #24`, while `k(f() * 8)` emits only `lsls #3`.
+- A member pointer local reused across calls (`W *w = &s->win; k(w); k(w);`, large offset) can keep the offset in a callee-saved register and emit `adds r0, r5, r4` per use, while `k(&s->win)` each time rebuilds the constant.
+- `case -1:` beside cases 0..6 joins the jump table (`adds r0, r0, #1; cmp r0, #7`), while `if (x != -1) switch (x)` compares -1 separately and bounds the table with `cmp r0, #6`.
+- A `BOOL` function ending `s->c = 1; return TRUE;` shares one `movs r0, #1` and can assign saved parameters to r4/r5 in the opposite order from the `void` version.
+- `for (i = 0; i < n; i++, p++) k(*p);` can emit a duplicated loop-entry `ble`, while moving `p++` to the end of the body emits only one.
+- A struct copy `T v = *p;` from a spilled pointer parameter that is dead afterwards can write the advanced `ldmia` pointer back to its stack slot (`str r2, [sp, #0]`) with no pointer increment in the source, and omits that store if `p` is used later.
+- An inline absolute value (`d < 0 ? -d : d`, or a macro that expands to it) emits `bpl; negs`, while `abs(d)` emits `bl abs`.
+- Local `u8` arrays can start at odd stack addresses (`u8 a[5], b[5];` gives `add r0, sp, #8; adds r0, #2`), while `u16 a[4], b[4];` sit on aligned 8-byte spacing.
+- A load from a `const` extern table passed as an argument can be scheduled earlier among the stack-argument setup: with `g(0, 1, 2, tb[i].x, tb[i].y, 5)`, `extern const E tb[]` loads r3 before the stack stores finish, while without `const` it loads r3 after them.
+- Comparing an enum with non-negative constants branches signed (`e < A3` gives `bge`), while `e < (u32)A3` branches unsigned (`bcs`).
+- A `static inline` helper such as `f(s->obj, s->flag)` with body `if (flag == 1) g(obj);` can load `obj` before the guarding `cmp`, while a direct `if (s->flag == 1) g(s->obj);` loads it after the branch.
+- In a pointer-chasing loop, `for (i = 0; p != NULL; p = p->next, i++) k(p->v, a[i]);` can keep a counter `i` beside the strength-reduced offset, while moving `i++` to the end of the body eliminates it.
+- A `u32` stack parameter used across branches and calls can be copied into a new local stack slot (`sub sp, #8`), while an `int` parameter is reloaded from its incoming slot, so try signedness when only spills differ.
+- Returning a `u16` field from an `s16` function (`s16 t(S *s) { return s->a; }`) emits `movs; ldrsh`, while a `u16` return type emits a bare `ldrh`, so match the prototype's signedness to the load.
+- A field reloaded after a compare with no intervening store or call (`if (s->x > 0) k(s->x);` loading twice) can mean the member is `volatile s16 x;`, since a plain member reuses the loaded value.

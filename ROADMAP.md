@@ -101,13 +101,13 @@ The live pilot (50 untried functions) matched 96% at $0.10 per match once two ch
 - Reference layouts from `REFERENCE_REPOS` (SPEC §16.3): deferred until a reference repo is set up.
 - Lint: pointer math on struct pointers is flagged (SPEC §9, `LINT_VERSION` 2).
 - `tu_data`: move a fully converted TU's data sections into C so it leaves no assembly (`integrate --data`, data check by location).
-- `rematch run --finish`: the types and data steps run with the live loop.
+- `rematch run --finish`: the types and data steps run with the live loop, in one prepare pool with the function step (new functions first).
 - 24-hour unattended live run.
 
 **Exit criteria**
-- [ ] At least one TU whose duplicate provisional types a `type_merge` attempt merged, every function re-verified by the piece check, and at least one failed attempt that left the piece unchanged (TU-local merging replaced module-wide clustering, SPEC §16.2)
-- [ ] An integrated TU compiles against shared or TU-local types only (no provisional duplicates)
-- [ ] A fully matched TU with data integrated with no assembly left
+- [x] At least one TU whose duplicate provisional types a `type_merge` attempt merged, every function re-verified by the piece check, and at least one failed attempt that left the piece unchanged (TU-local merging replaced module-wide clustering, SPEC §16.2)
+- [x] An integrated TU compiles against shared or TU-local types only (no provisional duplicates)
+- [x] A fully matched TU with data integrated with no assembly left
 - [ ] 24-hour unattended live run with no crashed orchestrator and no orphaned leases after restart
 
 ---
@@ -120,6 +120,8 @@ The live pilot (50 untried functions) matched 96% at $0.10 per match once two ch
 - [x] Human review queue (`rematch stuck`, `--show`, `--accept`). Human fixes feed back as learnings candidates.
 - Naming pass (SPEC §16.5): a cheaper model proposes function, type and field names from evidence, a human approves them with `rematch names review`, and the integrator applies accepted renames on `rematch/live` with the usual hash check.
 - Upstream sync routine (§12).
+- [x] Prototype overrides (SPEC §6.4, §10): a `rematch:protos` block corrects a placeholder header prototype; integration edits the header and later work reads rematch/live's committed headers. A quarter of the first real run's failures were blocked by such prototypes.
+- [x] Context headers are preceded by the headers defining the types they use (context v11), for headers that only compile after others.
 
 **Exit criteria (rolling, weekly)**
 - [ ] Weekly report: new matches, integrated TUs, stuck-queue size and trend, cost per match, shared types accepted, names approved

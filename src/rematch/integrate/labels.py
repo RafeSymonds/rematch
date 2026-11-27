@@ -11,7 +11,12 @@ from __future__ import annotations
 import bisect
 import hashlib
 import json
+import os
 import re
+import shutil
+import tempfile
+import threading
+from pathlib import Path
 
 from rematch.session import Session
 from rematch.toolchain.compile_db import CompileEntry
@@ -39,8 +44,11 @@ def label_table(s: Session, entry: CompileEntry) -> Labels:
         raw = json.loads(cache.read_text(encoding="utf-8"))
         return {sec: [(int(o), str(n)) for o, n in rows] for sec, rows in raw.items()}
     labels = defined_labels(text)
-    work = s.settings.rematch_workdir.expanduser() / "labels" / key
-    work.mkdir(parents=True, exist_ok=True)
+    # workers on the same TU build this table at the same time: each assembles in its own
+    # directory, and the cache is replaced atomically
+    root = s.settings.rematch_workdir.expanduser() / "labels"
+    root.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(dir=root, prefix=f"{key}-"))
     copy = work / source.name
     copy.write_text(
         text.rstrip("\n") + "\n\n" + "".join(f"\t.global {n}\n" for n in labels), encoding="utf-8"
@@ -53,8 +61,11 @@ def label_table(s: Session, entry: CompileEntry) -> Labels:
     if result.returncode != 0 or not out.is_file():
         raise LabelError(f"assembling {copy.name}: {(result.stderr or result.stdout)[-500:]}")
     table = labels_from_object(read_object(out), labels)
+    shutil.rmtree(work, ignore_errors=True)
     cache.parent.mkdir(parents=True, exist_ok=True)
-    cache.write_text(json.dumps(table), encoding="utf-8")
+    tmp = cache.with_name(f".{cache.name}.{os.getpid()}.{threading.get_ident()}")
+    tmp.write_text(json.dumps(table), encoding="utf-8")
+    os.replace(tmp, cache)
     return table
 
 

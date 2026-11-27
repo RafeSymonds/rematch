@@ -15,6 +15,7 @@ pass adds it.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -91,3 +92,68 @@ def target_file(target_dir: Path) -> RuleFile:
 def sandbox_text(files: list[RuleFile]) -> str:
     """LEARNINGS.md for a sandbox: every scope's rules, compiler first."""
     return "\n".join(f.markdown() for f in files)
+
+
+# --- choosing rules for TASK.md (SPEC §13.1) --------------------------------------------
+
+_WORD = re.compile(r"[a-z_][a-z0-9_]*")
+# Words of rule text that name a code shape; a target "has" one when its assembly shows it.
+_SHAPES = {
+    "switch": r"\badd\s+pc\b|\.short\b",
+    "stack": r"\bsp\b",
+    "bitfield": r"\blsls\b.*\n.*\blsrs\b",
+    "signed": r"\bldrs[bh]\b|\basrs\b",
+    "struct": r"\bldm|\bstm",
+}
+
+
+def target_features(target_s: str) -> set[str]:
+    """Mnemonics and code shapes in a target's assembly (`loop`: a backward branch)."""
+    words = {m.split(".")[0] for m in re.findall(r"^\s*([a-z][a-z0-9.]*)\b", target_s, re.M)}
+    shapes = {name for name, pat in _SHAPES.items() if re.search(pat, target_s, re.M)}
+    seen: set[str] = set()
+    for line in target_s.splitlines():
+        label = re.match(r"^(\.L\d+):", line)
+        if label:
+            seen.add(label.group(1))
+        branch = re.search(r"\bb[a-z]*\s+(\.L\d+)", line)
+        if branch and branch.group(1) in seen:
+            shapes.add("loop")
+            break
+    return words | shapes
+
+
+def relevance(rule: Rule, features: set[str], idf: dict[str, float]) -> float:
+    """Shared words weighted by how rare they are among the rules, plus code shapes."""
+    text = rule.text.lower()
+    words = set(_WORD.findall(text))
+    score = sum(idf.get(w, 0.0) for w in words & features)
+    score += sum(2.0 for shape in (*_SHAPES, "loop") if shape in features and shape in text)
+    return score
+
+
+def selected_text(files: list[RuleFile], target_s: str, k: int) -> str:
+    """The `k` rules most relevant to this target, every scope, for TASK.md; the full set
+    stays in LEARNINGS.md."""
+    import math
+
+    features = target_features(target_s)
+    rules = [r for f in files for r in f.rules]
+    df: dict[str, int] = {}
+    for r in rules:
+        for w in set(_WORD.findall(r.text.lower())):
+            df[w] = df.get(w, 0) + 1
+    idf = {w: math.log((1 + len(rules)) / (1 + n)) for w, n in df.items()}
+    ranked = sorted(
+        ((relevance(r, features, idf), -i, r) for i, r in enumerate(rules)),
+        key=lambda t: (t[0], t[1]),
+        reverse=True,
+    )
+    total = sum(len(f.rules) for f in files)
+    chosen = [r for score, _, r in ranked[:k] if score > 0]
+    if not chosen:
+        return "(No rules match this function's shape; LEARNINGS.md has all of them.)"
+    lines = [f"- {r.text}" for r in chosen]
+    if total > len(chosen):
+        lines.append(f"\n({total - len(chosen)} more rules in LEARNINGS.md: grep it by topic.)")
+    return "\n".join(lines)

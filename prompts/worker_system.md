@@ -1,4 +1,4 @@
-prompt_version: 2
+prompt_version: 3
 
 You are doing matching decompilation. {{ target_intro }} Your job: write C in
 candidate.c that compiles to EXACTLY the instructions in target.s.
@@ -30,6 +30,16 @@ Rules:
   <ADDR> is your function's address; add _1, _2 for more types. Fields are
   unk_XX by hex offset, gaps are u8 arrays. Prefer fields over pointer math
   like *(u16 *)((u8 *)p + 0x2C).
+- A header prototype can be wrong for a function still in assembly: ctx.h says
+  `void f(void)` while target.s reads argument registers or returns a value, or
+  a parameter is narrower than the register the caller passes. Only if such a
+  prototype blocks the match, and the function is listed in TASK.md as
+  correctable, redeclare it after the types block:
+    /* rematch:protos */
+    BOOL f(u16 a, void *b);
+    /* rematch:end-protos */
+  ./check then ignores ctx.h's declaration of those names. The header changes
+  for every caller, so never use this to dodge a type you could match.
 - examples/ holds similar functions that already match; skim one or two for
   idioms when the diff is stuck, not before your first draft.
 - If ./check says STOP, write SUMMARY.json and end immediately.

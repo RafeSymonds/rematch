@@ -102,7 +102,8 @@ def context_stub(
     include_dirs = s.definition.source.include_dirs if s.definition.source else []
     headers = ["global.h"]
     if index is not None:
-        for name in callees:
+        # the target's own header first: a known prototype it must keep, then its callees'
+        for name in [fn.name, *callees]:
             for h in index.headers_for(name):
                 form = _include_form(h, include_dirs)
                 if form not in headers:
@@ -178,6 +179,7 @@ class SandboxOptions:
     bench: bool = False  # §7.2: anonymous symbol, scrubbed context
     examples: tuple[FunctionRecord, ...] = ()
     task_md: bool = True
+    previous_best: tuple[str, float] | None = None  # (source, score) of an earlier attempt
 
 
 def anonymous_name(s: Session, module: str, address: int) -> str:
@@ -364,6 +366,8 @@ def build_sandbox(
     else:
         candidate = f"// Write {symbol} here. Its prototype, if known, is in ctx.h.\n"
     (out / "candidate.c").write_text(candidate, encoding="utf-8")
+    if opts.previous_best is not None:
+        (out / "previous_best.c").write_text(opts.previous_best[0], encoding="utf-8")
     (out / "NOTES.md").write_text("", encoding="utf-8")
     # Claude Code denies Write on a file that doesn't exist yet even when the path is allowed,
     # so the worker's report file exists from the start.
@@ -390,8 +394,8 @@ def build_sandbox(
                 module=fn.module,
                 examples=example_names,
                 draft=draft is not None,
-                previous_best=None,
-                previous_best_score=None,
+                previous_best=opts.previous_best is not None,
+                previous_best_score=f"{opts.previous_best[1]:.1f}" if opts.previous_best else None,
                 max_checks=s.settings.max_checks,
                 version_cond=fn.version_cond,
                 asm_target=fn.source_kind == "asm",

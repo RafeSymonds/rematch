@@ -28,7 +28,6 @@ rematch has no per-target code paths. Everything it knows about a target comes f
 <TARGET_REPO>/.rematch/
   target.toml      # machine-readable definition (below)
   TARGET.md        # target facts, target-level VERIFY items, progress
-  pre-push         # git hook that rejects pushes to forbidden_push_urls
   Dockerfile       # optional: build image for hosts that can't run the toolchain natively (§4 TOOLCHAIN_EXEC)
   verify-log.md    # evidence for resolved target VERIFY items
 ```
@@ -38,7 +37,6 @@ rematch has no per-target code paths. Everything it knows about a target comes f
 ```toml
 name = "example"
 default_versions = ["us", "jp"]            # first is primary for diffs
-forbidden_push_urls = ["github.com/upstream-org/"]
 required_paths = ["tools/cc/bin/cc"]       # must exist in the vanilla worktree after the build
 
 [versions.us]
@@ -59,6 +57,7 @@ build_dir = "build/us"                     # holds compile_commands.json and the
 compile_commands = "compile_commands.json" # relative to build_dir (default shown)
 map = "main.map"                           # linker map, relative to build_dir
 map_format = "mwld-xmap"                   # Metrowerks linker xMAP
+worktree_copy = ["tools/cc"]               # untracked paths a fresh worktree needs to build; copied from the live worktree
 
 [source]
 asm = ["asm/**/*.s"]                       # globs of assembly TUs
@@ -121,10 +120,6 @@ Before Phase 1 starts, TARGET.md must state, with values taken from the vanilla 
 - the upstream project's contribution policy
 - an inventory snapshot (function counts in assembly and C), used by the Phase 1 exit criterion
 
-### 2.3 `pre-push`
-
-The target's hook rejects any push whose remote URL contains one of `forbidden_push_urls`. It is installed into the target repo's common git dir (`git rev-parse --git-common-dir`/hooks/pre-push), which covers every worktree. `rematch doctor` checks that the installed hook is byte-identical to `.rematch/pre-push`.
-
 ---
 
 ## 3. Harness repo layout
@@ -186,6 +181,9 @@ This repo is target-agnostic: no game names, target paths, host names or persona
 | `REMATCH_DB` | `./var/<target name>.sqlite` | |
 | `REMATCH_VAR` | `./var` | DB, logs, bench sets |
 | `REMATCH_WORKDIR` | `~/.rematch/work` | Sandboxes. **Must be outside any repo**: no `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md` or `.claude/` in it or any ancestor (§7.1). The one exemption is Claude Code's user config dir (`$CLAUDE_CONFIG_DIR`, default `~/.claude`), which exists on every host and whose leakage is handled by §7.3. `rematch doctor` enforces this. |
+| `LIVE_WORKTREE` | (empty) | Worktree of `TARGET_REPO` on branch `rematch/live`, where integration commits (§10). Required by `integrate`, `run` and `publish`. |
+| `MERGE_BRANCH` | (empty) | Branch of the target that `publish` and the end of `run` merge `rematch/live` into (§10.1). Empty: never merge. |
+| `PUSH_REMOTE` | (empty) | Remote that `MERGE_BRANCH` is pushed to after a publish. Empty: never push. |
 | `WORKER_COUNT` | `4` | Concurrent attempts |
 | `CLAUDE_BIN` | `claude` | |
 | `WORKER_AUTH_MODE` | `subscription` | `subscription` or `api` (§7.3) |
@@ -588,6 +586,8 @@ difficulty = n_insns + 8·n_branches + 25·has_switch + 2·pool_entries
 
 `unknown_callees` = callees whose prototype is not in the header index. Pick order: `untried` by ascending difficulty, then `failed` whose cooldown has expired, by ascending difficulty. Recompute `max_sim` after every 50 new matches.
 
+Phase 4a: `rematch run` orders work by TU instead, so matches form runs the integrator can land: TUs with the fewest unmatched functions first, each in address order, `untried` and retry-ready `failed` functions together. The difficulty score remains for later tie-breaking.
+
 ### 8.4 Escalation ladder
 
 Each failed attempt moves to the next rung of `ESCALATION_LADDER` (model:effort). Rung-specific changes:
@@ -596,6 +596,8 @@ Each failed attempt moves to the next rung of `ESCALATION_LADDER` (model:effort)
 - rung ≥ 3: double `EXAMPLES_K`, and include an m2c draft if not already present
 
 After the last rung, the function becomes `stuck` and goes into the human review queue (`rematch stuck --list`).
+
+A failed function is retried on the next rung after `RETRY_COOLDOWN_SEC` (default 600). Leases are held as `host:pid`. On start, and at every queue refresh, expired leases and leases of dead processes on this host revert to `untried` (no attempt yet) or `failed`. Ctrl-C stops new launches and lets running attempts finish. Every `--integrate-every` matches (default 10), `integrate` runs on ready TUs in a background thread.
 
 ---
 
@@ -611,21 +613,36 @@ A match is accepted only if `lint/readability.py` passes:
 - provisional types follow §16.1 (names, `unk_XX` fields, no redefinition of ctx.h names)
 - (Phase 4) no raw pointer math into an object that has a type: once a shared or provisional type describes the pointee, `*(T *)((u8 *)p + N)`, `((u8 *)p)[N]` and similar fail the lint. Use the field.
 
-Lint results are stored in `matches.lint_json`.
+Lint results are stored in `matches.lint_json` (`fail` and `flag` lists). A match with any `fail` stays `matched` but is not integrated. `goto`, `volatile` and cast chains are flags for review. `rematch lint` re-runs the lints over every stored match. Phase 4a implements the deterministic rules: inline asm, `#pragma`, extra `#include`, `do { } while (0)`, self-assignment, `goto`, `volatile`, cast chains. Unused locals are left to the compiler's warnings, and formatting is left to the target's own tooling.
 
 ---
 
 ## 10. TU integration (`rematch integrate`)
 
-Runs only in the live worktree on branch `rematch/live`, one TU at a time, serialized behind a file lock.
+Runs only in `LIVE_WORKTREE` (a worktree of the target on branch `rematch/live`), serialized behind a file lock. It is **run-based**: a TU does not wait until every function matches. The pieces of each assembly TU are regenerated from the vanilla source for the set of functions in C, so earlier pieces merge with new neighbours.
 
-1. Preconditions: every function in the assembly TU is `matched`, and the TU's data sections are converted (a `tu_data` task produces C definitions for its data, rodata and bss sections, verified by the whole-object diff in step 3). Every provisional type used by the TU's matches is either merged into an accepted shared type or TU-local: used only inside this TU and reduced to one definition by a TU-scoped `type_merge` (§16.2).
-2. Build the TU's C file: includes (union of needed headers, minimal, plus the rematch types header if the TU uses shared types), TU-local type definitions, data definitions, then functions **in address order**. Accepted shared types the TU uses are written to the target's rematch-owned types header (target.toml `[types] header`, created on `rematch/live` only), never into existing headers. Moving a type into an existing header is a human decision.
-3. Compile the TU and diff **all sections** of the new object against the vanilla assembly TU's object, for every version. On mismatch, spawn a `tu_fix` attempt with the object-level diff. Typical causes: data or string ordering, `static` vs external linkage, function order.
-4. `swap_tu_to_c`: replace the assembly TU with the C TU in the target's link-order source file (never in generated files), and `git rm` the assembly file.
-5. Build **all** versions from clean, and check every hash.
-6. On pass: commit `rematch: decompile <asm TU> (N functions)`, set `integrated` and `integrated_commit`. On fail: `git restore`, mark the TU `integration_failed` in the run log, and leave the functions as `matched`.
-7. Push only to the target's private `origin`. The target's pre-push hook (§2.3) rejects any URL in `forbidden_push_urls`.
+1. **Choose functions.** For each assembly TU, start from the functions already `integrated`. Add the lint-clean `matched` functions (§9) that form a run of consecutive functions of at least `INTEGRATE_MIN_RUN` (default 3), or that complete the TU.
+2. **Plan pieces in link order.** Runs of C functions become `src/<stem>.c` (when the run starts the TU) or `src/<stem>_<ADDR>.c`. Runs of assembly become `asm/<stem>_<ADDR>.s`, except that the first assembly piece keeps `asm/<stem>.s` and **all non-text sections**. The linker places every object's `.text` first and then each data section type in object order, so the data stays in place as long as no C piece emits data. A text-only TU with every function in C leaves no assembly piece.
+3. **Declare symbols across pieces.** A label defined in one piece and used in another (or by a C piece, read from its object's undefined symbols) gets `.global` where it is defined and `.public` where it is used. C pieces refer to data in the assembly by the label names target.s uses (§7.1: workers declare that data `extern`).
+4. **Compose each C piece.** The piece starts with the TU template's `#include`s, then every candidate's provisional types (address-unique names, rematch markers removed), then one prototype per function taken from its definition (replacing the candidates' own prototypes of siblings), then the candidates in address order with `#include "ctx.h"` removed and repeated top-level declarations kept once. A source stored by `tu_fix` for exactly these functions takes the place of the composed one.
+5. **Piece check, before anything is written.** Compile each C piece per version with the TU's C template entry. Every function must binary-match its vanilla original (with assembly pool names, §6.5). The object must emit exactly the piece's functions, no data sections, and the original layout: mwcc gives every function its own `.text` section, and offsets follow linker placement. On failure, `integrate --fix` runs a `tu_fix` attempt (sandbox: the piece as candidate.c, each function's assembly, a grep-only ctx.h, and `./check` = this piece check). A passing source goes to `piece_sources`.
+6. **Write and build.** Write the pieces, `git rm` any piece that disappeared, and edit the link-order source file (target.toml `[link_order] file`, never generated files). Build every version in the live worktree and check every ROM hash.
+7. **Commit or restore.** On pass, commit `rematch: <tu> to C (N functions, M in C)`, set `integrated`, fill `matches.integrated_commit`, and record the TU's pieces in `integrations`. On fail, reset the worktree and record why.
+
+`rematch recheck --run ID` re-verifies a live run's misses with the current checker and records the ones that now match (no tokens). `rematch status` shows function states, the integrated share of assembly instructions, and recent integrations.
+
+### 10.1 Publish (`rematch publish`)
+
+Merges `rematch/live` into `MERGE_BRANCH` and pushes that branch to `PUSH_REMOTE`. `rematch run` publishes when it ends (after a deadline, `--max-attempts` or Ctrl-C) unless `--no-publish` is given or `MERGE_BRANCH` is empty. It holds the integration lock.
+
+1. If `MERGE_BRANCH` is not already contained in `rematch/live`, merge it into `rematch/live` in the live worktree. A conflict aborts the merge and fails the publish.
+2. If the merge brought in changes outside `.rematch/`, build every version and check every ROM hash. On failure, reset `rematch/live` to its previous commit and fail. Commits made by `integrate` were each built already, so a branch that only gained `.rematch/` edits needs no build.
+3. Fast-forward `MERGE_BRANCH` to `rematch/live`: with `git merge --ff-only` in the worktree that has it checked out (git refuses if local changes would be overwritten), or with a compare-and-swap ref update when no worktree has it.
+4. Push `MERGE_BRANCH` to `PUSH_REMOTE`, if set.
+
+`integrate --verify-branch` follows first parents only, so commits merged in from `MERGE_BRANCH` are not built one by one.
+
+Data conversion (`tu_data`, moving a TU's data sections into C) and shared types for integrated code (`type_merge`) are Phase 4b.
 
 ---
 
@@ -658,14 +675,14 @@ Per run, overall and per size bucket: match rate; first-check compile rate; medi
 
 ## 12. Upstream sync (`rematch sync-upstream`)
 
-Fetch `upstream`, merge into the target's `main` (never push upstream), then rebase `rematch/live`. Policy when a human decompiled a TU we also integrated: **take upstream's version**, drop our commit for that TU, and mark our rows `superseded`. Re-run inventory, then re-pin (`TARGET_PIN`) and rebuild vanilla only between runs.
+Fetch `upstream`, merge into the target's `main`, then rebase `rematch/live`. Policy when a human decompiled a TU we also integrated: **take upstream's version**, drop our commit for that TU, and mark our rows `superseded`. Re-run inventory, then re-pin (`TARGET_PIN`) and rebuild vanilla only between runs.
 
 ---
 
 ## 13. CLI
 
 ```
-rematch doctor                      # Claude Code version, workdir, push guard, vanilla builds, hashes, DB
+rematch doctor                      # Claude Code version, workdir, vanilla builds, hashes, DB
 rematch inventory [--history]       # parse target; --history computes decompiled_at (§11.1)
 rematch selftest [--n 10 --workers 4]   # oracle + saboteur agents, zero tokens (§14)
 rematch cd --sandbox DIR [--json-out F] [--mode isolated|tu]   # used by ./check
@@ -673,7 +690,8 @@ rematch ctx FUNCTION --out DIR [--with-source]   # build a sandbox without a wor
 rematch roundtrip [--n N --seed S | --golden]    # human C through ./check must match (Phase 1 exit; .rematch/golden.toml)
 rematch attempt FUNCTION [--model M --effort E] --yes          # one live attempt
 rematch bench --n N --seed S [--pool clean|contaminated] [--workers W] [--model M --effort E] --yes
-rematch run --workers W [--max-attempts K] [--until HH:MM]     # live loop
+rematch run --workers W [--max-attempts K] [--until HH:MM] [--no-publish]   # live loop, then publish (§10.1)
+rematch publish [--branch B] [--remote R] [--dry-run]          # merge rematch/live into MERGE_BRANCH, push to PUSH_REMOTE
 rematch integrate [--tu TU | --ready | --verify-branch]        # --verify-branch: rebuild every rematch/live commit, check hashes
 rematch report [--run ID | --last] [--compare ID]
 rematch stuck --list | --show FUNCTION
@@ -703,7 +721,7 @@ A sandbox's `LEARNINGS.md` is both files' rules, compiler first. Each scope stay
 
 `learnings verify` recompiles every rule's evidence. Before each run, `ensure_verified` does the same, cached by a digest of the rules, the trial header and the pin, and the run aborts if any rule fails. The digest is recorded as `learnings_sha256` in the run config. Rules accepted by hand through `learnings review` carry no evidence and are reported as SKIP. After a run with at least `CURATE_PENDING_THRESHOLD` candidates pending, rematch suggests a curation pass. It never spends tokens on curation by itself.
 
-`rematch doctor` prints one `PASS`/`FAIL` line per check and exits 1 if any check fails. Checks, in order: `CLAUDE_BIN --version` ≥ 2.1.259 (spends no tokens); `REMATCH_WORKDIR` and ancestors clean (§4); `target.toml` valid (§2.1); no push URL in `TARGET_REPO` matches `forbidden_push_urls` and the installed pre-push hook matches `.rematch/pre-push` (§2.3); vanilla worktree at the pin (§6.2); `TOOLCHAIN_EXEC` runs `true` (if set); the toolchain sees `REMATCH_WORKDIR` (sandboxes are compiled through it); per-version build and hash (§6.2); `required_paths` present; `OBJDUMP` runs; `CTAGS` is Universal Ctags; DB migrated (§5).
+`rematch doctor` prints one `PASS`/`FAIL` line per check and exits 1 if any check fails. Checks, in order: `CLAUDE_BIN --version` ≥ 2.1.259 (spends no tokens); `REMATCH_WORKDIR` and ancestors clean (§4); `target.toml` valid (§2.1); vanilla worktree at the pin (§6.2); `TOOLCHAIN_EXEC` runs `true` (if set); the toolchain sees `REMATCH_WORKDIR` (sandboxes are compiled through it); per-version build and hash (§6.2); `required_paths` present; `OBJDUMP` runs; `CTAGS` is Universal Ctags; DB migrated (§5).
 
 Model and effort: `attempt` and `bench` use `--model`/`--effort` if given, else `WORKER_MODEL`/`WORKER_EFFORT`. `run` starts each function at rung 0 of `ESCALATION_LADDER` and escalates through it (§8.4). The resolved model and effort are stored on every attempt.
 

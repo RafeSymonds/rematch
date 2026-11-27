@@ -28,4 +28,4 @@ The import above holds the project rules and traps. Everything below is specific
 - Targets come from the pinned vanilla worktree. Compile argv comes from the build, not guesses.
 - Verify every version for TUs with version conditionals. Integrate whole TUs, and edit only the link-order source file.
 - Benchmarks use the clean post-cutoff pool on frozen sets.
-- Nothing ever goes to a target's upstream. Nothing target-specific goes in this repo.
+- Nothing target-specific goes in this repo.

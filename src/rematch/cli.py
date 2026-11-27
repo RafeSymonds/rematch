@@ -46,7 +46,7 @@ def main() -> None:
 
 @app.command()
 def doctor() -> None:
-    """Check Claude Code, workdir isolation, push guard, vanilla builds, hashes and the DB."""
+    """Check Claude Code, workdir isolation, vanilla builds, hashes and the DB."""
     settings = _settings()
     failed = False
     for result in iter_doctor(settings, log=_echo_err):
@@ -369,6 +369,7 @@ def bench(
 def pilot(
     n: int = typer.Option(50, help="Untried assembly functions to attempt."),
     seed: int = typer.Option(1),
+    tu: list[str] = typer.Option([], "--tu", help="Attempt every untried function in these TUs."),
     workers: int | None = typer.Option(None),
     model: str | None = typer.Option(None),
     effort: str | None = typer.Option(None),
@@ -383,7 +384,18 @@ def pilot(
     s = _session()
     conn = store.connect(s.db_path)
     try:
-        ids = live_sample(conn, n, seed)
+        if tu:
+            marks = ",".join("?" * len(tu))
+            ids = [
+                int(r[0])
+                for r in conn.execute(
+                    f"SELECT id FROM functions WHERE source_kind = 'asm' AND status = 'untried'"
+                    f" AND tu_path IN ({marks}) ORDER BY tu_path, address",
+                    tu,
+                )
+            ]
+        else:
+            ids = live_sample(conn, n, seed)
         fns = load_functions(conn, ids)
     finally:
         conn.close()
@@ -405,7 +417,7 @@ def pilot(
         log=_echo_err,
         effort_for=effort_for,
         extra_config={
-            "pilot": {"n": n, "seed": seed, "function_ids": ids},
+            "pilot": {"n": n, "seed": seed, "tus": tu, "function_ids": ids},
             "effort_by_size": s.settings.effort_by_size if effort_for else None,
         },
     )
@@ -414,6 +426,269 @@ def pilot(
         typer.echo(format_report(run_metrics(conn, result.run_id)))
     finally:
         conn.close()
+
+
+@app.command()
+def recheck(
+    run: int = typer.Option(..., help="Live run whose non-matching attempts to re-verify."),
+) -> None:
+    """Re-verify a live run's misses with the current checker (no tokens)."""
+    from rematch.worker.recheck import recheck_run
+
+    s = _session()
+    new_run, results = recheck_run(s, run, _echo_err)
+    for r in results:
+        typer.echo(f"{'MATCH' if r.matched else 'miss '} {r.function}: {r.detail}")
+    n = sum(r.matched for r in results)
+    typer.echo(f"{n}/{len(results)} recovered" + (f" (run {new_run})" if new_run else ""))
+
+
+@app.command("integrate")
+def integrate_cmd(
+    tu: list[str] = typer.Option([], "--tu", help="Assembly TU(s) to integrate."),
+    ready: bool = typer.Option(False, "--ready", help="Every TU with ready matches."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Plan and check pieces; write nothing."),
+    fix: bool = typer.Option(False, "--fix", help="Run a tu_fix agent on failing pieces."),
+    verify_branch_: bool = typer.Option(
+        False, "--verify-branch", help="Build every rematch/live commit and check hashes."
+    ),
+    model: str | None = typer.Option(None),
+    effort: str | None = typer.Option(None),
+    yes: bool = typer.Option(False, "--yes", help="Confirm token spend (with --fix)."),
+) -> None:
+    """Move matched functions into C on rematch/live, verified by full builds (SPEC §10)."""
+    from rematch.integrate.run import IntegrateError, integrate, ready_tus, verify_branch
+    from rematch.integrate.tu_fix import run_tu_fix
+
+    s = _session()
+    if verify_branch_:
+        try:
+            results = verify_branch(s, _echo_err)
+        except IntegrateError as exc:
+            typer.echo(f"FAIL {exc}")
+            raise typer.Exit(1) from exc
+        for sha, ok, detail in results:
+            typer.echo(f"{'PASS' if ok else 'FAIL'} {sha[:10]} {detail[:300]}")
+        if not all(ok for _, ok, _ in results):
+            raise typer.Exit(1)
+        return
+    fixer = None
+    if fix:
+        _confirm_spend("tu_fix (one attempt per failing piece)", 1, yes)
+        m, e = _model_effort(model, effort)
+
+        def fixer(tu: str, check: object, asm: dict[str, str]) -> bool:
+            from rematch.integrate.run import PieceCheck
+
+            assert isinstance(check, PieceCheck) and check.control is not None
+            fconn = store.connect(s.db_path)
+            try:
+                targets = {n: asm[n] for n in check.piece.functions}
+                out = run_tu_fix(s, fconn, check.control, check.source, targets, m, e, _echo_err)
+            finally:
+                fconn.close()
+            return out.matched
+
+    conn = store.connect(s.db_path)
+    try:
+        tus = list(tu) or (ready_tus(conn) if ready else [])
+        if not tus:
+            typer.echo("nothing to do: pass --tu or --ready")
+            raise typer.Exit(2)
+        try:
+            outcomes = integrate(s, conn, tus, dry_run=dry_run, log=_echo_err, fix=fixer)
+        except IntegrateError as exc:
+            typer.echo(f"FAIL {exc}")
+            raise typer.Exit(1) from exc
+    finally:
+        conn.close()
+    for o in outcomes:
+        typer.echo(f"{o.status:9} {o.tu}: {o.detail}")
+    if any(o.status == "failed" for o in outcomes):
+        raise typer.Exit(1)
+
+
+@app.command("run")
+def run_cmd(
+    workers: int | None = typer.Option(None),
+    max_attempts: int | None = typer.Option(None, help="Stop launching after this many."),
+    until: str | None = typer.Option(None, help="Stop launching at HH:MM (local time)."),
+    integrate_every: int = typer.Option(10, help="Integrate ready TUs after this many matches."),
+    no_integrate: bool = typer.Option(False, "--no-integrate"),
+    fix: bool = typer.Option(False, "--fix", help="Let integration run tu_fix agents."),
+    no_publish: bool = typer.Option(
+        False, "--no-publish", help="Don't merge into MERGE_BRANCH or push at the end."
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Confirm token spend."),
+) -> None:
+    """The unattended live loop: attempt, escalate, integrate, publish (SPEC §8, §10)."""
+    from datetime import datetime, timedelta
+
+    from rematch.integrate.run import integrate, ready_tus
+    from rematch.integrate.tu_fix import run_tu_fix
+    from rematch.live.loop import run_live
+
+    s = _session()
+    stop_at = None
+    if until:
+        hh, mm = (int(x) for x in until.split(":"))
+        local = datetime.now().astimezone()
+        stop_at = local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if stop_at <= local:
+            stop_at += timedelta(days=1)
+    _confirm_spend("live run", max_attempts or 0, yes)
+
+    def fixer(tu: str, check: object, asm: dict[str, str]) -> bool:
+        from rematch.integrate.run import PieceCheck
+
+        assert isinstance(check, PieceCheck) and check.control is not None
+        fconn = store.connect(s.db_path)
+        try:
+            m, e = _model_effort(None, None)
+            targets = {n: asm[n] for n in check.piece.functions}
+            return run_tu_fix(
+                s, fconn, check.control, check.source, targets, m, e, _echo_err
+            ).matched
+        finally:
+            fconn.close()
+
+    def integrate_ready() -> list[str]:
+        iconn = store.connect(s.db_path)
+        try:
+            outcomes = integrate(
+                s,
+                iconn,
+                ready_tus(iconn),
+                dry_run=False,
+                log=_echo_err,
+                fix=fixer if fix else None,
+            )
+        finally:
+            iconn.close()
+        for o in outcomes:
+            if o.status != "skipped":
+                _echo_err(f"integrate {o.tu}: {o.status} {o.detail[:300]}")
+        return [o.tu for o in outcomes if o.status == "committed"]
+
+    stats = run_live(
+        s,
+        workers=workers or s.settings.worker_count,
+        max_attempts=max_attempts,
+        until=stop_at,
+        integrate_every=integrate_every,
+        integrate_fn=None if no_integrate else integrate_ready,
+        log=_echo_err,
+    )
+    typer.echo(
+        f"run {stats.run_id}: {stats.launched} attempts, {stats.matched} matched,"
+        f" {stats.failed} failed, {stats.errors} errors; integrated {stats.integrated}"
+    )
+    if s.settings.merge_branch and not no_publish:
+        _publish(s, None, None, dry_run=False)
+
+
+def _publish(s: Session, branch: str | None, remote: str | None, dry_run: bool) -> None:
+    from rematch.integrate.publish import PublishError, publish_live
+
+    try:
+        r = publish_live(s, _echo_err, branch, remote, dry_run)
+    except PublishError as exc:
+        typer.echo(f"FAIL publish: {exc}")
+        raise typer.Exit(1) from exc
+    what = "would move to" if dry_run else "at"
+    merged = ", merged" + (" and built" if r.built else "") if r.merged else ""
+    pushed = f", pushed to {r.pushed}" if r.pushed else ""
+    typer.echo(f"publish: {r.branch} {what} {r.head[:10]}{merged}{pushed}")
+
+
+@app.command("publish")
+def publish_cmd(
+    branch: str | None = typer.Option(None, help="Branch to merge into (default MERGE_BRANCH)."),
+    remote: str | None = typer.Option(
+        None, help="Remote to push the branch to (default PUSH_REMOTE; '' = don't push)."
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Say what would happen; change nothing."),
+) -> None:
+    """Merge rematch/live into a branch of the target and push it (SPEC §10.1)."""
+    _publish(_session(), branch, remote, dry_run)
+
+
+@app.command("status")
+def status_cmd() -> None:
+    """Live progress: function states, integrated share, recent integrations."""
+    s = _session()
+    conn = store.connect(s.db_path)
+    try:
+        rows = conn.execute(
+            "SELECT status, COUNT(*), SUM(n_insns) FROM functions WHERE source_kind = 'asm'"
+            " GROUP BY status ORDER BY status"
+        ).fetchall()
+        total_n = sum(r[1] for r in rows)
+        total_i = sum(r[2] or 0 for r in rows)
+        typer.echo(f"assembly functions at the pin: {total_n} ({total_i} instructions)")
+        for st, n, insns in rows:
+            typer.echo(
+                f"  {st:11} {n:6}  {100 * (insns or 0) / max(total_i, 1):5.2f}% of instructions"
+            )
+        tus = conn.execute(
+            "SELECT COUNT(DISTINCT tu_path) FROM integrations WHERE status = 'committed'"
+        ).fetchone()[0]
+        whole = conn.execute(
+            "SELECT COUNT(*) FROM (SELECT tu_path FROM functions WHERE source_kind = 'asm'"
+            " GROUP BY tu_path HAVING SUM(status != 'integrated') = 0)"
+        ).fetchone()[0]
+        typer.echo(f"TUs with integrated code: {tus}; fully converted: {whole}")
+        for tu, st, sha, detail, at in conn.execute(
+            "SELECT tu_path, status, commit_sha, detail, created_at FROM integrations"
+            " ORDER BY id DESC LIMIT 5"
+        ):
+            typer.echo(f"  {at} {st:9} {tu} {(sha or '')[:10]} {(detail or '')[:120]}")
+    finally:
+        conn.close()
+
+
+@app.command("tu-check", hidden=True)
+def tu_check_cmd(
+    sandbox: Path = typer.Option(...),
+    control: Path = typer.Option(...),
+) -> None:
+    """./check inside a tu_fix sandbox."""
+    from rematch.integrate.tu_fix import tu_check
+
+    text, code = tu_check(sandbox, control)
+    typer.echo(text)
+    raise typer.Exit(code)
+
+
+@app.command("lint")
+def lint_cmd() -> None:
+    """Run the §9 readability lints over every stored match (no tokens)."""
+    from rematch.lint.readability import lint
+
+    s = _session()
+    conn = store.connect(s.db_path)
+    try:
+        rows = conn.execute(
+            "SELECT m.function_id, f.name, m.c_source FROM matches m"
+            " JOIN functions f ON f.id = m.function_id ORDER BY f.name"
+        ).fetchall()
+        failed = 0
+        with conn:
+            for fid, name, source in rows:
+                result = lint(source)
+                conn.execute(
+                    "UPDATE matches SET lint_json = ? WHERE function_id = ?",
+                    (result.to_json(), fid),
+                )
+                if result.fail or result.flag:
+                    typer.echo(
+                        f"{'FAIL' if result.fail else 'flag'} {name}: "
+                        + "; ".join(result.fail + result.flag)
+                    )
+                failed += not result.ok
+    finally:
+        conn.close()
+    typer.echo(f"{len(rows) - failed}/{len(rows)} matches pass")
 
 
 @app.command()

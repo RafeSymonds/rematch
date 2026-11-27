@@ -6,13 +6,12 @@ Read in this order before changing anything: `SPEC.md` (authoritative contracts)
 
 ## Hard rules
 
-1. **Never push, PR or open issues against a target's upstream.** Many decomp projects ban LLM-generated contributions. Each target lists its forbidden URLs in `target.toml` (`forbidden_push_urls`), its upstream push URL is disabled, and its pre-push hook blocks them. Don't "fix" that.
-2. **Never commit ROMs, BIOS files, firmware or save files**, or anything extracted from a cart that isn't already in the target repo. `.gitignore` covers these, so keep it that way.
-3. **Never write to the target repo** except through `rematch integrate` on branch `rematch/live` in the live worktree, or edits to its `.rematch/` directory. The vanilla worktree is read-only, always.
-4. **Never run anything that spends model tokens** (`rematch attempt|bench|run`, or the real `claude` binary) unless the maintainer explicitly asked in this session. Tests and selftests use the fake agents in `selftest/`.
-5. **SPEC is the contract.** If you change a contract (schema, CLI, tool output, sandbox layout, invocation flags, target.toml fields), update SPEC.md in the same change. Resolve VERIFY items with evidence and record the evidence.
-6. **Don't weaken the checker.** Nothing may make `./check` or outcome classification report a match the binary comparison in SPEC §6.5 wouldn't.
-7. **Keep this repo target-agnostic.** No game names, target paths, host names, machine details or personal setup. Target facts go in the target's `.rematch/`. Machine settings go in the gitignored `.env`.
+1. **Never commit ROMs, BIOS files, firmware or save files**, or anything extracted from a cart that isn't already in the target repo. `.gitignore` covers these, so keep it that way.
+2. **Never write to the target repo** except through `rematch integrate` on branch `rematch/live` in the live worktree, `rematch publish` into the configured `MERGE_BRANCH`, or edits to its `.rematch/` directory. The vanilla worktree is read-only, always.
+3. **Never run anything that spends model tokens** (`rematch attempt|bench|run`, or the real `claude` binary) unless the maintainer explicitly asked in this session. Tests and selftests use the fake agents in `selftest/`.
+4. **SPEC is the contract.** If you change a contract (schema, CLI, tool output, sandbox layout, invocation flags, target.toml fields), update SPEC.md in the same change. Resolve VERIFY items with evidence and record the evidence.
+5. **Don't weaken the checker.** Nothing may make `./check` or outcome classification report a match the binary comparison in SPEC §6.5 wouldn't.
+6. **Keep this repo target-agnostic.** No game names, target paths, host names, machine details or personal setup. Target facts go in the target's `.rematch/`. Machine settings go in the gitignored `.env`.
 
 ## Commands
 
@@ -21,7 +20,7 @@ uv sync                                  # install
 uv run pytest -q                         # tests (must stay green)
 uv run ruff check && uv run ruff format --check
 uv run mypy src
-uv run rematch doctor                    # environment, push guard, vanilla builds, hashes
+uv run rematch doctor                    # environment, vanilla builds, hashes
 uv run rematch inventory                 # safe, no tokens
 uv run rematch selftest                  # oracle/saboteur agents, no tokens
 uv run rematch ctx <FUNCTION> --out /tmp/sbx   # build a sandbox to inspect, no tokens
@@ -41,7 +40,7 @@ The target's build commands are in its `target.toml`. Never build inside the van
 
 - Tests added or updated and passing. Lint and type checks are clean.
 - SPEC/ROADMAP updated if contracts or phase status changed.
-- For changes affecting worker behavior (prompts, context, sandbox, hints): note the `prompt_version` / `context_version` bump, and say that a benchmark comparison is needed. Don't run it yourself unless asked (rule 4).
+- For changes affecting worker behavior (prompts, context, sandbox, hints): note the `prompt_version` / `context_version` bump, and say that a benchmark comparison is needed. Don't run it yourself unless asked (rule 3).
 
 ---
 

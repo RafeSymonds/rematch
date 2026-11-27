@@ -63,7 +63,6 @@ def test_bad_toml_syntax(tmp_path: Path) -> None:
         ({"us": f'build = ["make"]\nrom = "../us.bin"\nsha1 = "{SHA}"'}, "relative"),
         ({"us": f'build = ["make"]\nrom = "/abs/us.bin"\nsha1 = "{SHA}"'}, "relative"),
         ({"extra": 'required_paths = ["a/../../b"]'}, "relative"),
-        ({"extra": 'forbidden_push_urls = [" "]'}, "non-empty"),
         ({"extra": 'typo_field = "x"'}, "typo_field"),
         ({"name": '"../evil"'}, "name"),
         ({"default_versions": "[]"}, "default_versions"),

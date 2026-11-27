@@ -72,6 +72,7 @@ class Section:
     data: bytes  # empty for NOBITS (.bss)
     relocs: list[Reloc] = field(default_factory=list)
     nobits: bool = False
+    align: int = 1
 
 
 @dataclass
@@ -148,7 +149,13 @@ def read_object(path: Path) -> ObjectFile:
         for index, esec in enumerate(elf.iter_sections()):
             nobits = esec["sh_type"] == "SHT_NOBITS"
             data = b"" if nobits else esec.data()
-            sections[index] = Section(index=index, name=esec.name, data=data, nobits=nobits)
+            sections[index] = Section(
+                index=index,
+                name=esec.name,
+                data=data,
+                nobits=nobits,
+                align=max(1, int(esec["sh_addralign"])),
+            )
 
         symbols: list[Symbol] = []
         symtab = elf.get_section_by_name(".symtab")

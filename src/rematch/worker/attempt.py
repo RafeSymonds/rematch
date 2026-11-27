@@ -15,6 +15,7 @@ from typing import Protocol
 from rematch import prompts
 from rematch.context import CONTEXT_VERSION
 from rematch.db import store
+from rematch.lint.readability import lint
 from rematch.session import Session
 from rematch.types.probe import measure, signature
 from rematch.types.provisional import TypesError, extract_block, parse_block
@@ -317,7 +318,7 @@ def run_attempt(s: Session, spec: AttemptSpec, log: Log) -> tuple[int, Classifie
                         attempt_id,
                         c.best_source,
                         ",".join(c.verified_versions),
-                        json.dumps({"phase2": "pre-filter only; §9 lints arrive in Phase 4"}),
+                        lint(c.best_source).to_json(),
                         now(),
                     ),
                 )

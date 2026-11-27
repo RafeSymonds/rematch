@@ -11,7 +11,6 @@ Build an agent system that converts compiled assembly into C which, compiled wit
 
 ### Non-goals
 
-- Contributing to upstream decomp projects. Many ban LLM-generated contributions, and rematch respects that.
 - A general-purpose decompiler, a PC port, or ROM hacking tooling.
 - "Functionally equivalent" C. Only byte-identical counts.
 
@@ -74,7 +73,7 @@ Difficulty comes from size, branches, switch tables, literal pool size and unkno
 Related decomp projects (same engine family or same compiler) often contain near-identical functions in C. Retrieving the most similar function from those repos, by opcode-sequence similarity (which requires building them once), should help a lot. In benchmark reports this is tracked as a separate ablation so its effect is visible.
 
 ### D12. The core is target-agnostic
-Everything rematch knows about a target comes from the target repo's `.rematch/` directory: build commands, expected hashes, forbidden push URLs, and the facts in TARGET.md. rematch has no per-game code paths and this repo holds no target data, host names or personal setup. Adding a target means writing its `.rematch/`, not changing rematch. Machine-specific settings (paths, a container prefix for toolchains that can't run natively) live in the gitignored `.env`.
+Everything rematch knows about a target comes from the target repo's `.rematch/` directory: build commands, expected hashes, and the facts in TARGET.md. rematch has no per-game code paths and this repo holds no target data, host names or personal setup. Adding a target means writing its `.rematch/`, not changing rematch. Machine-specific settings (paths, a container prefix for toolchains that can't run natively) live in the gitignored `.env`.
 
 ## 5. Risks
 

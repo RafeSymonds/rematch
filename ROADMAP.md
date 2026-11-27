@@ -8,14 +8,14 @@ Token spend starts in Phase 2.
 
 ## Phase 0: Harness skeleton and first target ready
 
-- Target repo has `.rematch/` (`target.toml`, `TARGET.md`, `pre-push`; SPEC §2). Upstream push disabled. The pre-push hook blocks `forbidden_push_urls`.
+- Target repo has `.rematch/` (`target.toml`, `TARGET.md`; SPEC §2).
 - Vanilla worktree at `TARGET_PIN` builds every version on the build host.
 - Resolve the target's Phase 0 **VERIFY** items in TARGET.md: object paths for asm and C TUs, map file location.
 - Harness skeleton: `pyproject.toml`, Typer CLI, config loading, DB schema and migrations, `rematch doctor`.
 - Type-recovery schema (SPEC §5, §16): `shared_types`, `provisional_types`, `type_uses`, `name_proposals`, and the `type_merge` and `naming` task kinds. The tables stay empty until Phase 2.
 
 **Exit criteria**
-- [ ] `rematch doctor` passes: Claude Code ≥ 2.1.259, `REMATCH_WORKDIR` clean (SPEC §4), push guard installed, every vanilla ROM hash matches `target.toml`, `required_paths` present, DB migrated to the latest schema (type-recovery tables included)
+- [ ] `rematch doctor` passes: Claude Code ≥ 2.1.259, `REMATCH_WORKDIR` clean (SPEC §4), every vanilla ROM hash matches `target.toml`, `required_paths` present, DB migrated to the latest schema (type-recovery tables included)
 - [ ] Your own dump's hash equals the target's expected hash for that version (optional, recommended)
 - [ ] The target's TARGET.md has no remaining Phase 0 VERIFY markers
 
@@ -75,23 +75,37 @@ Changes are made one at a time, each measured on the **same** frozen set (`b100-
 
 ---
 
-## Phase 4: Live loop and integration
+## Phase 4a: Land live matches
 
-- Scheduler, leases, heartbeat, escalation ladder (SPEC §8).
-- Readability lints as the acceptance gate (§9).
-- `tu_data` and `tu_fix` task kinds. TU integrator (§10) on `rematch/live`.
-- `type_merge` task kind (SPEC §16.2): clustering, an agent proposes one definition, the gate re-verifies every match that uses it, accepted types flow into ctx.h. A TU-scoped merge runs before integration. Shared types are written to the target's rematch types header on `rematch/live`.
-- Reference layouts from `REFERENCE_REPOS` (SPEC §16.3) as merge proposals through the same gate.
-- Lint: no raw pointer math into an object that has a type (SPEC §9).
-- `rematch run --workers N` with graceful shutdown and resume.
+The live pilot (50 untried functions) matched 96% at $0.10 per match once two checker artifacts were fixed, so landing matches became the bottleneck. Whole-TU integration rarely completes: the median assembly TU has 21 functions. So integration is run-based (SPEC §10).
+
+- `rematch recheck`: re-verify misses after checker fixes (no tokens).
+- Readability lints as the integration gate (§9).
+- Run-based integrator on `rematch/live`: split assembly TUs, C pieces checked before writing, every version built with every hash checked, commit or restore.
+- `tu_fix` task kind for pieces whose candidates conflict.
+- `rematch run`: leases with heartbeat and dead-process recovery, TU-ordered work, escalation ladder with `previous_best.c`, background integration, graceful shutdown.
+- `rematch status`.
+- `rematch publish`: merge `rematch/live` into a chosen branch, verified, and push it. `run` publishes when it ends.
 
 **Exit criteria**
-- [ ] 24-hour unattended live run with no crashed orchestrator and no orphaned leases after restart
-- [ ] At least 1 assembly TU fully converted, integrated and committed on `rematch/live`, with every version's hash passing on that commit
-- [ ] Every commit on `rematch/live` builds every version with matching hashes (spot-check script `rematch integrate --verify-branch`)
-- [ ] Report shows live match rate, cost per match and the outcome distribution
+- [x] At least 1 assembly TU fully converted, integrated and committed on `rematch/live`, with every version's hash passing on that commit
+- [ ] A 2-hour unattended `rematch run`, killed and restarted, with no orphaned leases
+- [ ] `integrate --verify-branch` passes on every `rematch/live` commit
+- [x] Report shows the live match rate, cost per match and the outcome distribution
+
+## Phase 4b: Types and data for integrated code
+
+- `type_merge` task kind (SPEC §16.2): clustering, an agent proposes one definition, the gate re-verifies every match that uses it, and accepted types flow into ctx.h and the target's rematch types header on `rematch/live`.
+- Reference layouts from `REFERENCE_REPOS` (SPEC §16.3) as merge proposals through the same gate.
+- Lint: no raw pointer math into an object that has a type (SPEC §9).
+- `tu_data`: move a TU's data sections into C so fully matched TUs leave no assembly.
+- 24-hour unattended live run.
+
+**Exit criteria**
 - [ ] At least one shared type accepted by `type_merge`, with every match in its `type_uses` re-verified at 100%, and at least one rejected merge that left the DB unchanged
-- [ ] The integrated TU compiles against shared or TU-local types only (no provisional duplicates)
+- [ ] An integrated TU compiles against shared or TU-local types only (no provisional duplicates)
+- [ ] A fully matched TU with data integrated with no assembly left
+- [ ] 24-hour unattended live run with no crashed orchestrator and no orphaned leases after restart
 
 ---
 

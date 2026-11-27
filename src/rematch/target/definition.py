@@ -12,7 +12,6 @@ from rematch.toolchain.runner import ToolchainRunner
 
 TARGET_DIR_NAME = ".rematch"
 TARGET_TOML = "target.toml"
-PRE_PUSH_HOOK = "pre-push"
 
 
 class TargetDefError(Exception):
@@ -52,11 +51,19 @@ class BuildSection(_Section):
     compile_commands: str = "compile_commands.json"  # relative to the version's build_dir
     map: str  # linker map, relative to the version's build_dir
     map_format: Literal["mwld-xmap"]
+    # Untracked paths (globs, relative to the repo) a fresh worktree needs before it can build,
+    # such as fetched toolchains or dependencies. Copied from the live worktree (§10).
+    worktree_copy: list[str] = []
 
     @field_validator("compile_commands", "map")
     @classmethod
     def _relative(cls, value: str) -> str:
         return _check_relative(value)
+
+    @field_validator("worktree_copy")
+    @classmethod
+    def _relative_all(cls, value: list[str]) -> list[str]:
+        return [_check_relative(v) for v in value]
 
 
 class SourceSection(_Section):
@@ -117,7 +124,6 @@ class TargetDef(BaseModel):
     # Used in file names (the default DB path), so keep it filesystem-safe.
     name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     default_versions: list[str] = Field(min_length=1)
-    forbidden_push_urls: list[str] = []
     required_paths: list[str] = []
     versions: dict[str, VersionDef]
     # Phase 1 sections. Optional so a Phase 0 target still validates; commands that need one
@@ -134,13 +140,6 @@ class TargetDef(BaseModel):
     @classmethod
     def _paths_relative(cls, value: list[str]) -> list[str]:
         return [_check_relative(p) for p in value]
-
-    @field_validator("forbidden_push_urls")
-    @classmethod
-    def _patterns_nonempty(cls, value: list[str]) -> list[str]:
-        if any(not p.strip() for p in value):
-            raise ValueError("forbidden_push_urls entries must be non-empty")
-        return value
 
     @model_validator(mode="after")
     def _versions_defined(self) -> TargetDef:

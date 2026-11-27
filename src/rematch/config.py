@@ -23,6 +23,16 @@ class Settings(BaseSettings):
     rematch_db: Path | None = None
     rematch_var: Path = Path("./var")
     rematch_workdir: Path = Path("~/.rematch/work")
+    # Worktree of TARGET_REPO on branch rematch/live, where integration commits (SPEC §10).
+    live_worktree: Path | None = None
+    # `rematch publish` and the end of `rematch run` merge rematch/live into this branch of the
+    # target (empty: never) and push it to PUSH_REMOTE (empty: never). SPEC §10.1.
+    merge_branch: str = ""
+    push_remote: str = ""
+    # Integrate a run of matched functions only if it has this many, or it completes the TU.
+    integrate_min_run: int = Field(default=3, ge=1)
+    # Live loop (SPEC §8): wait before retrying a failed function on the next ladder rung.
+    retry_cooldown_sec: float = Field(default=600, ge=0)
 
     worker_count: int = Field(default=4, ge=1)
     claude_bin: str = "claude"
@@ -54,13 +64,15 @@ class Settings(BaseSettings):
     compile_timeout_sec: float = Field(default=20, gt=0)
     log_level: str = "info"
 
-    @field_validator("rematch_db", mode="before")
+    @field_validator("rematch_db", "live_worktree", mode="before")
     @classmethod
     def _empty_db_is_unset(cls, value: object) -> object:
         # `.env.example` ships `REMATCH_DB=`; an empty value means "use the default".
         return None if value == "" else value
 
-    @field_validator("target_repo", "rematch_db", "rematch_var", "rematch_workdir", mode="after")
+    @field_validator(
+        "target_repo", "rematch_db", "rematch_var", "rematch_workdir", "live_worktree", mode="after"
+    )
     @classmethod
     def _expand_user(cls, value: Path | None) -> Path | None:
         # Absolute from here on: these paths are handed to processes running in sandboxes.

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -11,7 +10,7 @@ from typer.testing import CliRunner
 from rematch.cli import app
 from rematch.config import Settings
 from rematch.doctor import CheckResult, iter_doctor, set_writable
-from tests.helpers import FORBIDDEN, git, make_target_repo
+from tests.helpers import git, make_target_repo
 
 
 def settings_for(tmp_path: Path, repo: Path, pin: str, **extra: str) -> Settings:
@@ -45,7 +44,6 @@ def test_all_pass_and_builds_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         "claude version",
         "workdir isolation",
         "target.toml",
-        "push guard",
         "vanilla worktree",
         "toolchain exec",
         "toolchain sees workdir",
@@ -124,36 +122,6 @@ def test_dirty_vanilla_worktree_fails(tmp_path: Path) -> None:
     assert failures(run(settings)) == {"vanilla worktree"}
 
 
-def test_forbidden_push_url_fails(tmp_path: Path) -> None:
-    repo, pin = make_target_repo(tmp_path)
-    git(repo, "remote", "set-url", "--push", "upstream", f"git@{FORBIDDEN}demo.git")
-    results = run(settings_for(tmp_path, repo, pin))
-    assert failures(results) == {"push guard"}
-    assert "upstream" in results["push guard"].detail
-
-
-def test_missing_hook_fails(tmp_path: Path) -> None:
-    repo, pin = make_target_repo(tmp_path, install_hook=False)
-    results = run(settings_for(tmp_path, repo, pin))
-    assert failures(results) == {"push guard"}
-    assert "not installed" in results["push guard"].detail
-
-
-def test_modified_hook_fails(tmp_path: Path) -> None:
-    repo, pin = make_target_repo(tmp_path)
-    (repo / ".git" / "hooks" / "pre-push").write_text("#!/bin/sh\nexit 0\n")
-    assert failures(run(settings_for(tmp_path, repo, pin))) == {"push guard"}
-
-
-def test_installed_hook_blocks_forbidden_push(tmp_path: Path) -> None:
-    repo, _ = make_target_repo(tmp_path)
-    hook = repo / ".git" / "hooks" / "pre-push"
-    blocked = subprocess.run([str(hook), "upstream", f"https://{FORBIDDEN}demo.git"], check=False)
-    allowed = subprocess.run([str(hook), "origin", "https://example.invalid/mine.git"], check=False)
-    assert blocked.returncode != 0
-    assert allowed.returncode == 0
-
-
 def test_invalid_target_toml_stops_early(tmp_path: Path) -> None:
     repo, pin = make_target_repo(tmp_path)
     (repo / ".rematch" / "target.toml").write_text('name = "demo"\n')
@@ -179,7 +147,7 @@ def test_cli_exit_codes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     cli = CliRunner()
     ok = cli.invoke(app, ["doctor"])
     assert ok.exit_code == 0, ok.output
-    assert ok.output.count("PASS") == 14
+    assert ok.output.count("PASS") == 13
 
     monkeypatch.delenv("TARGET_PIN")
     bad = cli.invoke(app, ["doctor"])

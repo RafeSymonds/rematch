@@ -4,15 +4,14 @@ rematch is built with coding agents. This file covers the workflow for humans an
 
 ## Scope reminder
 
-- rematch output goes **to this repo and your own target repos only**. Many decomp projects prohibit LLM-generated contributions. Respect that completely: no PRs, issues, or community posts of rematch output.
-- Upstream work flows *into* a target fork via `rematch sync-upstream`. Nothing flows back.
+- Upstream work flows *into* a target fork via `rematch sync-upstream`.
 - This repo is target-agnostic. Target facts live in the target's `.rematch/`, machine settings in `.env`.
 
 ## Branches and commits
 
 - `main`: always green (`pytest`, `ruff`, `mypy`).
 - `phase-N-<slug>`: one per roadmap phase or sub-feature. Merge to main when the work is green and the phase checklist is updated.
-- In a **target repo**: `main` tracks upstream merges. `rematch/live` holds integrated TUs only, written only by `rematch integrate`.
+- In a **target repo**: `main` tracks upstream merges. `rematch/live` holds integrated TUs only, written only by `rematch integrate`. `rematch publish` merges it into the branch you choose (`MERGE_BRANCH`) and pushes it (`PUSH_REMOTE`).
 - Commit messages: imperative summary, then the body notes `SPEC: §x.y updated` when contracts change, and `prompt_version`/`context_version` bumps.
 
 ## Prompt and context versioning

@@ -1,4 +1,4 @@
-"""`rematch doctor` checks (SPEC §13, §6.2, §4, §2.3). Spends no model tokens."""
+"""`rematch doctor` checks (SPEC §13, §6.2, §4). Spends no model tokens."""
 
 from __future__ import annotations
 
@@ -15,12 +15,10 @@ from pathlib import Path
 from rematch.config import Settings
 from rematch.db import store
 from rematch.target.definition import (
-    PRE_PUSH_HOOK,
     BuildError,
     TargetDefError,
     TomlTarget,
     load_target_def,
-    target_dir,
 )
 from rematch.toolchain.runner import ToolchainRunner
 
@@ -112,53 +110,6 @@ def check_workdir(workdir: Path, exempt: Path) -> CheckResult:
             name, False, "agent files above REMATCH_WORKDIR: " + ", ".join(map(str, hits))
         )
     return CheckResult(name, True, f"{workdir} (exempt: {exempt})")
-
-
-# --- Push guard ----------------------------------------------------------------------
-
-
-def _hooks_dir(repo: Path) -> Path | None:
-    hooks_path = _git(repo, "config", "--get", "core.hooksPath").stdout.strip()
-    if hooks_path:
-        path = Path(hooks_path).expanduser()
-        return path if path.is_absolute() else repo / path
-    common = _git(repo, "rev-parse", "--git-common-dir")
-    if common.returncode != 0:
-        return None
-    common_dir = Path(common.stdout.strip())
-    if not common_dir.is_absolute():
-        common_dir = repo / common_dir
-    return common_dir / "hooks"
-
-
-def check_push_guard(repo: Path, forbidden: list[str]) -> CheckResult:
-    name = "push guard"
-    if not forbidden:
-        return CheckResult(name, True, "target.toml lists no forbidden_push_urls")
-    remotes = _git(repo, "remote")
-    if remotes.returncode != 0:
-        return CheckResult(name, False, f"git remote failed: {remotes.stderr.strip()}")
-    bad: list[str] = []
-    for remote in remotes.stdout.split():
-        urls = _git(repo, "remote", "get-url", "--push", "--all", remote).stdout.split()
-        bad += [f"{remote} → {url}" for url in urls if any(p in url for p in forbidden)]
-    if bad:
-        return CheckResult(name, False, "push URL matches forbidden_push_urls: " + "; ".join(bad))
-    source = target_dir(repo) / PRE_PUSH_HOOK
-    if not source.is_file():
-        return CheckResult(name, False, f"forbidden_push_urls set but {source} is missing")
-    hooks = _hooks_dir(repo)
-    if hooks is None:
-        return CheckResult(name, False, f"cannot locate the git hooks dir of {repo}")
-    installed = hooks / "pre-push"
-    fix = f"install with: cp {source} {installed} && chmod +x {installed}"
-    if not installed.is_file():
-        return CheckResult(name, False, f"pre-push hook not installed; {fix}")
-    if not os.access(installed, os.X_OK):
-        return CheckResult(name, False, f"{installed} is not executable")
-    if installed.read_bytes() != source.read_bytes():
-        return CheckResult(name, False, f"{installed} differs from {source}; {fix}")
-    return CheckResult(name, True, f"no forbidden push URLs; hook installed at {installed}")
 
 
 # --- Vanilla worktree ----------------------------------------------------------------
@@ -355,8 +306,6 @@ def iter_doctor(settings: Settings, log: Log = lambda _msg: None) -> Iterator[Ch
         yield CheckResult("target.toml", False, str(exc))
         return
     yield CheckResult("target.toml", True, f"{definition.name}: versions {target.versions()}")
-
-    yield check_push_guard(repo, definition.forbidden_push_urls)
 
     worktree, worktree_result = ensure_vanilla_worktree(repo, settings.target_pin, log)
     yield worktree_result

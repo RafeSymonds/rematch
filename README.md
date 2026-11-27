@@ -27,7 +27,6 @@ There are two modes:
 
 ## Ground rules (non-negotiable)
 
-- **Nothing goes upstream.** Many decompilation projects ban LLM-generated contributions. rematch output stays in your own repo. Each target lists its forbidden push URLs in `target.toml`, disables its upstream push URL, and installs a pre-push hook that `rematch doctor` checks.
 - **No ROMs, BIOS files, or dumps are ever committed**, to this repo or a target repo. Targets build from source.
 - Only work on games you own.
 
@@ -42,16 +41,11 @@ There are two modes:
 ## Quickstart
 
 ```bash
-# 1. Target repo: your own fork or clone, with a .rematch/ directory (SPEC §2)
-cd /path/to/target
-git remote set-url --push upstream DISABLED
-cp .rematch/pre-push "$(git rev-parse --git-common-dir)/hooks/pre-push"
-
-# 2. Harness
+# Target repo: your own fork or clone, with a .rematch/ directory (SPEC §2)
 cd /path/to/rematch
 uv sync
 cp .env.example .env            # TARGET_REPO, TARGET_PIN, optional TOOLCHAIN_EXEC
-uv run rematch doctor           # Claude Code version, workdir, push guard, vanilla builds, hashes
+uv run rematch doctor           # Claude Code version, workdir, vanilla builds, hashes
 uv run rematch inventory        # parse the target, populate the DB
 uv run rematch selftest         # oracle agent end to end; spends NO tokens
 uv run rematch bench --n 25     # first real benchmark; spends tokens

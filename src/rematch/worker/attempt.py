@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import subprocess
 import time
@@ -337,6 +338,32 @@ def run_attempt(s: Session, spec: AttemptSpec, log: Log) -> tuple[int, Classifie
             + (f", resumed {totals.segments - 1}x" if totals.segments > 1 else "")
             + ")"
         )
+        prune_sandboxes(s, conn, spec.fn.id)
         return attempt_id, c
     finally:
         conn.close()
+
+
+def prune_sandboxes(s: Session, conn: sqlite3.Connection, fn_id: int) -> int:
+    """Delete a function's finished attempt sandboxes that nothing will read again (SPEC §7.1):
+    all of them once it matched (the source is in `matches`), else all but the latest and the
+    best-scoring one (the next rung's previous_best.c). Each holds a megabyte-sized ctx.h."""
+    rows = conn.execute(
+        "SELECT a.id, a.sandbox_path, coalesce(a.best_score, -1) FROM attempts a"
+        " WHERE a.function_id = ? AND a.task_kind = 'function' AND a.ended_at IS NOT NULL"
+        " AND a.sandbox_path IS NOT NULL ORDER BY a.id",
+        (fn_id,),
+    ).fetchall()
+    matched = conn.execute("SELECT 1 FROM matches WHERE function_id = ?", (fn_id,)).fetchone()
+    keep: set[int] = set()
+    if not matched and rows:
+        keep = {rows[-1][0], max(rows, key=lambda r: (r[2], r[0]))[0]}
+    root = (s.settings.rematch_workdir.expanduser() / "attempts").resolve()
+    removed = 0
+    for aid, path, _ in rows:
+        sandbox = Path(path)
+        if aid in keep or not sandbox.is_dir() or sandbox.resolve().parent != root:
+            continue
+        shutil.rmtree(sandbox, ignore_errors=True)
+        removed += 1
+    return removed

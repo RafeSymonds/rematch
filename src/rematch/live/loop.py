@@ -21,6 +21,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import NamedTuple
 
 from rematch.bench.run import _Gate
 from rematch.context.examples import similar_examples
@@ -45,11 +46,28 @@ def _iso(t: datetime) -> str:
     return t.astimezone(UTC).isoformat(timespec="seconds")
 
 
-def ladder(s: Session) -> list[tuple[str, str]]:
-    rungs = [r.split(":", 1) for r in s.settings.escalation_ladder.split(",") if ":" in r]
-    return [(m.strip(), e.strip()) for m, e in rungs] or [
-        (s.settings.worker_model, s.settings.worker_effort)
-    ]
+class Rung(NamedTuple):
+    model: str
+    effort: str
+    below: int | None = None  # only functions with fewer instructions climb this rung
+
+
+def ladder(s: Session) -> list[Rung]:
+    """ESCALATION_LADDER: `model:effort` rungs, comma-separated; `model:effort<N` applies only
+    to functions under N instructions (a cheap model for small functions)."""
+    out: list[Rung] = []
+    for part in s.settings.escalation_ladder.split(","):
+        if ":" not in part:
+            continue
+        model, rest = (x.strip() for x in part.split(":", 1))
+        effort, _, below = rest.partition("<")
+        out.append(Rung(model, effort.strip(), int(below) if below.strip() else None))
+    return out or [Rung(s.settings.worker_model, s.settings.worker_effort)]
+
+
+def function_ladder(rungs: list[Rung], n_insns: int) -> list[Rung]:
+    """The rungs a function of `n_insns` instructions climbs; its escalation indexes these."""
+    return [r for r in rungs if r.below is None or n_insns < r.below] or rungs[-1:]
 
 
 def _dead_local_owners(conn: sqlite3.Connection) -> list[str]:
@@ -123,20 +141,26 @@ def recover_leases(conn: sqlite3.Connection) -> int:
 ERROR_STREAK_STOP = 25  # consecutive errored attempts that stop launches
 
 
-def pick_order(conn: sqlite3.Connection, n_rungs: int, cooldown: float) -> list[tuple[int, int]]:
+def pick_order(
+    conn: sqlite3.Connection, rungs: list[Rung], cooldown: float
+) -> list[tuple[int, int]]:
     """(function id, rung) in work order: TUs with the fewest unmatched functions first."""
     ready_before = _iso(datetime.now(UTC) - timedelta(seconds=cooldown))
     rows = conn.execute(
-        "SELECT f.id, f.tu_path, f.address, f.escalation, t.left FROM functions f"
+        "SELECT f.id, f.escalation, f.n_insns, f.status FROM functions f"
         " JOIN (SELECT tu_path, SUM(status NOT IN ('matched','integrated')) AS left"
         "       FROM functions WHERE source_kind = 'asm' GROUP BY tu_path) t"
         "   ON t.tu_path = f.tu_path"
         " WHERE f.source_kind = 'asm' AND (f.status = 'untried'"
         "   OR (f.status = 'failed' AND f.escalation < ? AND f.updated_at < ?))"
         " ORDER BY t.left, f.tu_path, f.address",
-        (n_rungs, ready_before),
+        (len(rungs), ready_before),
     ).fetchall()
-    return [(int(fid), int(esc)) for fid, _tu, _addr, esc, _left in rows]
+    return [
+        (int(fid), int(esc))
+        for fid, esc, n, status in rows
+        if status == "untried" or esc < len(function_ladder(rungs, int(n or 0)))
+    ]
 
 
 def acquire(conn: sqlite3.Connection, fid: int, owner: str, ttl: float) -> bool:
@@ -149,8 +173,10 @@ def acquire(conn: sqlite3.Connection, fid: int, owner: str, ttl: float) -> bool:
     return cur.rowcount == 1
 
 
-def settle(conn: sqlite3.Connection, fid: int, c: Classified | None, n_rungs: int) -> None:
+def settle(conn: sqlite3.Connection, fid: int, c: Classified | None, rungs: list[Rung]) -> None:
     """After an attempt: clear the lease; a miss climbs the ladder or becomes stuck."""
+    row = conn.execute("SELECT n_insns FROM functions WHERE id = ?", (fid,)).fetchone()
+    n_rungs = len(function_ladder(rungs, int(row[0] or 0) if row else 0))
     with conn:
         if c is None or c.outcome == "error":  # harness or API error: the function is not at fault
             conn.execute(
@@ -262,9 +288,11 @@ def run_live(
 
     def one(fn: FunctionRecord, rung: int) -> tuple[FunctionRecord, Classified | None]:
         gate.wait()
-        model, effort = rungs[min(rung, len(rungs) - 1)]
         wconn = store.connect(s.db_path)
         try:
+            row = wconn.execute("SELECT n_insns FROM functions WHERE id = ?", (fn.id,)).fetchone()
+            own = function_ladder(rungs, int(row[0] or 0) if row else 0)
+            model, effort, _ = own[min(rung, len(own) - 1)]
             examples = tuple(similar_examples(s, wconn, fn, s.settings.examples_k, False, log))
             prev = previous_best(wconn, fn.id) if rung > 0 else None
         finally:
@@ -306,7 +334,7 @@ def run_live(
                     if not queue:
                         if n := recover_leases(conn):
                             log(f"recovered {n} expired lease(s)")
-                        queue = pick_order(conn, len(rungs), s.settings.retry_cooldown_sec)
+                        queue = pick_order(conn, rungs, s.settings.retry_cooldown_sec)
                         queue = [q for q in queue if q[0] not in running.values()]
                         if not queue:
                             break
@@ -324,7 +352,7 @@ def run_live(
                 for fut in finished:
                     fid = running.pop(fut)
                     fn, c = fut.result()
-                    settle(conn, fid, c, len(rungs))
+                    settle(conn, fid, c, rungs)
                     if c is None or c.outcome == "error":
                         stats.errors += 1
                         error_streak += 1

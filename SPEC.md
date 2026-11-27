@@ -485,6 +485,8 @@ Hints are suggestions and say so. New hints are added only with a test fixture.
 
 ### 7.1 Sandbox layout (one per attempt)
 
+**Retention.** After each attempt, the function's finished sandboxes that nothing will read again are deleted: all of them once it matched (the source is in `matches`), otherwise all but the latest and the best-scoring one (the next rung's `previous_best.c`). Each sandbox holds a megabyte-sized ctx.h, and a long run would otherwise fill the disk (16,000 sandboxes took 20 GB).
+
 Claude Code loads `CLAUDE.md` / `AGENTS.md` from the working directory **and every directory above it** (unless `--bare`). A sandbox inside the harness repo would therefore inject this repo's agent instructions into every worker. Sandboxes live under `REMATCH_WORKDIR`, outside all repos, and `rematch doctor` fails if `REMATCH_WORKDIR` or any ancestor contains `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md` or `.claude/`, except Claude Code's user config dir (§4).
 
 ```
@@ -597,7 +599,7 @@ Phase 4a: `rematch run` orders work by TU instead, so matches form runs the inte
 
 ### 8.4 Escalation ladder
 
-Each failed attempt moves to the next rung of `ESCALATION_LADDER` (model:effort). Every attempt records its rung in `attempts.escalation`. Rung-specific changes:
+Each failed attempt moves to the next rung of `ESCALATION_LADDER` (model:effort). A rung written `model:effort<N` applies only to functions with fewer than N instructions, so a cheap model can take small functions first: a function's ladder is the rungs that apply to its size, and its escalation counts within that ladder (stuck past its last rung). Every attempt records its rung in `attempts.escalation`. Rung-specific changes:
 - rung ≥ 1: include the previous best candidate and its diff in the sandbox as `previous_best.c` / `previous_best.diff`
 - rung ≥ 2: TU-context compile mode if available
 - rung ≥ 3: double `EXAMPLES_K`, and include an m2c draft if not already present

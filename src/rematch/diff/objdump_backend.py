@@ -10,6 +10,8 @@ Normalization makes two compilations of the same code compare equal:
 
 from __future__ import annotations
 
+import bisect
+import functools
 import hashlib
 import re
 import subprocess
@@ -137,17 +139,45 @@ def disassemble(
     obj: ObjectFile,
     self_names: dict[str, str] | None = None,
     pool_names: dict[str, dict[int, str]] | None = None,
+    only: set[str] | None = None,
 ) -> dict[str, list[Line]]:
     """Split objdump output into normalized lines per function symbol.
 
     `self_names` maps a function name to the name its self-references should be treated as
     (normally itself). `pool_names` names literal-pool words (function -> offset -> name) whose
     relocation is anonymous, e.g. a label local to an assembly file that the object does not
-    keep as a symbol.
+    keep as a symbol. `only` limits the result to those functions.
     """
-    funcs = {sym.name: sym for sym in obj.functions()}
+    every = {sym.name: sym for sym in obj.functions()}
+    listing = _listing(objdump_text, tuple(sorted((n, s.value, s.size) for n, s in every.items())))
+    funcs = {n: s for n, s in every.items() if only is None or n in only}
+    raw = {n: rows for n, rows in listing.items() if n in funcs}
+    out: dict[str, list[Line]] = {}
+    starts: dict[int, list[int]] = {}  # section -> sorted reloc offsets (relocs are sorted)
+    for name, entries in raw.items():
+        sym = funcs[name]
+        self_name = (self_names or {}).get(name, name)
+        section = obj.sections.get(sym.section) if sym.section is not None else None
+        by_off: dict[int, Reloc] = {}
+        if section is not None:
+            offs = starts.setdefault(section.index, [r.offset for r in section.relocs])
+            lo = bisect.bisect_left(offs, sym.value)
+            hi = bisect.bisect_left(offs, sym.value + sym.size)
+            for r in section.relocs[lo:hi]:
+                by_off[r.offset - sym.value] = r
+        names = (pool_names or {}).get(name, {})
+        out[name] = _normalize(entries, by_off, obj, sym, self_name, names)
+    return out
+
+
+@functools.lru_cache(maxsize=64)
+def _listing(
+    objdump_text: str, funcs: tuple[tuple[str, int, int], ...]
+) -> dict[str, list[tuple[int, str, str]]]:
+    """objdump lines per function: (offset, mnemonic, operands). Cached: the functions of one
+    object are disassembled one at a time from the same listing."""
+    where = {n: (value, size) for n, value, size in funcs}
     raw: dict[str, list[tuple[int, str, str]]] = {}
-    relocs: dict[str, dict[int, str]] = {}
     current: str | None = None
     for line in objdump_text.splitlines():
         if _SECTION.match(line):
@@ -156,38 +186,21 @@ def disassemble(
         header = _HEADER.match(line)
         if header:
             name = header.group("name")
-            current = name if name in funcs else current
-            if name in funcs:
+            current = name if name in where else current
+            if name in where:
                 raw.setdefault(name, [])
-                relocs.setdefault(name, {})
             continue
         if current is None:
             continue
-        sym = funcs[current]
-        reloc = _RELOC.match(line)
-        if reloc:
-            off = int(reloc.group("off"), 16) - sym.value
-            relocs[current][off] = reloc.group("type")
+        if _RELOC.match(line):
             continue
         insn = _INSN.match(line)
         if insn:
-            off = int(insn.group("off"), 16) - sym.value
-            if 0 <= off < sym.size:
+            value, size = where[current]
+            off = int(insn.group("off"), 16) - value
+            if 0 <= off < size:
                 raw[current].append((off, insn.group("mn"), insn.group("ops") or ""))
-
-    out: dict[str, list[Line]] = {}
-    for name, entries in raw.items():
-        sym = funcs[name]
-        self_name = (self_names or {}).get(name, name)
-        section = obj.sections.get(sym.section) if sym.section is not None else None
-        by_off: dict[int, Reloc] = {}
-        if section is not None:
-            for r in section.relocs:
-                if sym.value <= r.offset < sym.value + sym.size:
-                    by_off[r.offset - sym.value] = r
-        names = (pool_names or {}).get(name, {})
-        out[name] = _normalize(entries, by_off, obj, sym, self_name, names)
-    return out
+    return raw
 
 
 def _word_value(section_data: bytes, offset: int) -> int:

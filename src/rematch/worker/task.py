@@ -68,6 +68,9 @@ class Task(BaseModel):
     # Functions a rematch:protos block may redeclare: the target and its assembly-only callees
     # (SPEC §6.4). Their headers' prototypes may be placeholders.
     protos_allowed: list[str] = []
+    # Of those, functions C files call: they compiled against the header's parameters, so an
+    # override may change only the return type.
+    protos_keep_params: list[str] = []
 
     def save(self, sandbox: Path) -> None:
         (sandbox / TASK_FILE).write_text(self.model_dump_json(indent=2) + "\n", encoding="utf-8")

@@ -48,11 +48,32 @@ class Layout:
     base: dict[int, int] = field(default_factory=dict)  # section index -> offset (not saved)
 
 
-def layouts(obj: ObjectFile) -> dict[str, Layout]:
+def dead_sections(obj: ObjectFile, keep: set[str]) -> dict[int, list[str]]:
+    """Data sections the linker drops (dead stripping), with the symbols in each: no code,
+    no live data and no symbol in `keep` (names other files use) refers to them. mwcc emits
+    some data objects in a section of their own, and an unreferenced one disappears."""
+    data = {i for i, sec in obj.sections.items() if sec.alloc and sec.name in DATA_TYPES}
+    live = {i for i, sec in obj.sections.items() if sec.alloc and i not in data}
+    live |= {s.section for s in obj.symbols if s.name in keep and s.section in data}
+    todo = list(live)
+    while todo:
+        for r in obj.sections[todo.pop()].relocs:
+            target = r.symbol.section
+            if target in data and target not in live:
+                live.add(target)
+                todo.append(target)
+    dead: dict[int, list[str]] = {}
+    for i in sorted(data - live):
+        names = [s.name for s in obj.symbols if s.section == i and s.type != "SECTION" and s.name]
+        dead[i] = sorted(names)
+    return dead
+
+
+def layouts(obj: ObjectFile, skip: set[int] | None = None) -> dict[str, Layout]:
     out: dict[str, Layout] = {}
     raw: dict[str, bytearray] = {}
     for sec in sorted(obj.sections.values(), key=lambda s: s.index):
-        if sec.name not in DATA_TYPES or not sec.alloc:
+        if sec.name not in DATA_TYPES or not sec.alloc or sec.index in (skip or set()):
             continue
         lay = out.setdefault(sec.name, Layout(align=sec.align))
         buf = raw.setdefault(sec.name, bytearray())
@@ -275,7 +296,16 @@ def check_data(spec: DataSpec, source: str, work: Path) -> PieceResult:
         )
         if extra:
             result.errors.append(f"{version}: unexpected sections {extra}")
-        lays = layouts(obj)
+        dead = dead_sections(obj, set(spec.exports))
+        for names in dead.values():
+            result.errors.append(
+                f"{version}: nothing refers to {', '.join(names) or 'a data section'}, which"
+                " mwcc put in a section of its own, so the linker drops it and later data"
+                " moves. If target.s uses its value as a constant, the original code read it"
+                " at a constant index (mwcc folds that load): do the same where the value"
+                " appears, so it is referenced and placed with the other data."
+            )
+        lays = layouts(obj, set(dead))
         resolve = locator(lays)
         data_relocs(obj, lays, resolve)
         target_data = spec.data[version]

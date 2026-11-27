@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -52,6 +53,23 @@ class CompileDB:
 
     @classmethod
     def load(cls, path: Path, worktree: Path) -> CompileDB:
+        """Parsed once per file version and process: the file is megabytes, and every sandbox
+        and piece check reads it."""
+        try:
+            st = path.stat()
+        except OSError as exc:
+            raise CompileDBError(f"{path}: {exc}") from exc
+        key = (str(path), st.st_mtime_ns, st.st_size, str(worktree))
+        with _CACHE_LOCK:
+            hit = _CACHE.get(key)
+        if hit is None:
+            hit = cls._parse(path, worktree)
+            with _CACHE_LOCK:
+                _CACHE[key] = hit
+        return hit
+
+    @classmethod
+    def _parse(cls, path: Path, worktree: Path) -> CompileDB:
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -92,3 +110,7 @@ class CompileDB:
             if e.is_c and Path(e.output).parent == out_dir:
                 return e
         raise CompileDBError(f"no C entry shares an output directory with {tu_path}")
+
+
+_CACHE: dict[tuple[str, int, int, str], CompileDB] = {}
+_CACHE_LOCK = threading.Lock()

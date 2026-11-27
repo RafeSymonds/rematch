@@ -5,6 +5,7 @@ Phase 2 adds TASK.md, examples/, LEARNINGS.md, read-only inputs and hashing.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import re
 import sqlite3
@@ -247,9 +248,8 @@ def _vanilla_lines(
     """The target's normalized lines. For an assembly function, relocations to labels local to
     the assembly file are named from the TU's label table (`entry`, SPEC §6.5), or else from
     the source's `.word` operands (`asm_text`) when their count agrees."""
-    obj = read_object(obj_path)
-    text = run_objdump(s.settings.objdump, obj.path)
-    lines = disassemble(text, obj).get(name)
+    obj, text = _vanilla_object(s.settings.objdump, obj_path)
+    lines = disassemble(text, obj, only={name}).get(name)
     if lines is None:
         raise SandboxError(f"{name} not found in {obj_path}")
     names: dict[int, str] = {}
@@ -262,8 +262,23 @@ def _vanilla_lines(
     if not names and asm_text:
         names = asm_pool_names(asm_text, lines)
     if names:
-        lines = disassemble(text, obj, pool_names={name: names})[name]
+        lines = disassemble(text, obj, pool_names={name: names}, only={name})[name]
     return obj, lines
+
+
+def _vanilla_object(objdump: str, path: Path) -> tuple[ObjectFile, str]:
+    """The vanilla object and its objdump listing, read once per file version: every function
+    of a TU reads the same object, and an assembly TU's object can hold hundreds."""
+    st = path.stat()
+    return _vanilla_object_cached(objdump, str(path), st.st_mtime_ns, st.st_size)
+
+
+@functools.lru_cache(maxsize=48)
+def _vanilla_object_cached(
+    objdump: str, path: str, _mtime: int, _size: int
+) -> tuple[ObjectFile, str]:
+    obj = read_object(Path(path))
+    return obj, run_objdump(objdump, obj.path)
 
 
 _WORD = re.compile(r"^\s*(?:[\w.$]+:\s*)?\.word\s+([^;@]+?)\s*(?:[;@].*)?$")
@@ -330,6 +345,18 @@ def asm_only(s: Session, names: list[str]) -> list[str]:
     return [n for n in names if n in found]
 
 
+def called_from_c(s: Session, name: str) -> bool:
+    """True if a C file on rematch/live calls or declares `name`: it compiled against the
+    header's prototype, so an override would break it. A bare mention (a table entry) is fine."""
+    live = s.settings.live_worktree
+    if live is None or not (live / ".git").exists():
+        return False
+    pattern = rf"(^|[^A-Za-z0-9_$]){re.escape(name)}[[:space:]]*\("
+    argv = ["git", "-C", str(live), "grep", "-q", "-E", "-e", pattern, "rematch/live", "--", "*.c"]
+    out = subprocess.run(argv, capture_output=True, timeout=60)
+    return out.returncode == 0
+
+
 def build_sandbox(
     s: Session,
     fn: FunctionRecord,
@@ -356,11 +383,7 @@ def build_sandbox(
     tu_text = (s.worktree / fn.tu_path).read_text(encoding="utf-8", errors="replace")
     asm_source = asm_function_text(s, fn, tu_text)
     symbol = anonymous_name(s, fn.module, fn.address) if opts.bench else fn.name
-    index = (
-        HeaderIndex.from_json(s.header_index_path.read_text(encoding="utf-8"))
-        if s.header_index_path.is_file()
-        else None
-    )
+    index = HeaderIndex.load(s.header_index_path) if s.header_index_path.is_file() else None
 
     version_tasks: list[VersionTask] = []
     primary_lines: list[Line] = []
@@ -415,6 +438,7 @@ def build_sandbox(
     protos_allowed = (
         [] if opts.bench or fn.source_kind != "asm" else [symbol, *asm_only(s, sorted(called))]
     )
+    keep_params = [n for n in protos_allowed if called_from_c(s, n)]
     shown = FunctionRecord(
         fn.id, symbol, fn.address, fn.module, fn.tu_path, fn.source_kind, fn.mode, fn.version_cond
     )
@@ -479,6 +503,7 @@ def build_sandbox(
                 ctx_kb=(out / "ctx.h").stat().st_size // 1024,
                 learnings=inline,
                 protos_allowed=protos_allowed,
+                keep_params=keep_params,
             ),
             encoding="utf-8",
         )
@@ -499,6 +524,7 @@ def build_sandbox(
         prologue=wrap[0],
         epilogue=wrap[1],
         protos_allowed=protos_allowed,
+        protos_keep_params=keep_params,
     )
     task.save(control)
     return task

@@ -95,23 +95,27 @@ class ObjectFile:
         function with `.balign 4, 0` before setting its size, which a compiler never does.
         Two zero bytes at the end, marked as data (`$d`), are dropped from the size.
         """
+        memo = self.__dict__.get("_functions")
+        if memo is not None and memo[0] == len(self.symbols):
+            return list(memo[1])
+        marks = {(m.section, m.value) for m in self.symbols if m.name == "$d"}
         funcs = [
-            self._without_padding(s)
+            self._without_padding(s, marks)
             for s in self.symbols
             if s.type == "FUNC" and s.size > 0 and not s.is_mapping and s.section is not None
         ]
-        return sorted(funcs, key=lambda s: (s.section or 0, s.value))
+        funcs.sort(key=lambda s: (s.section or 0, s.value))
+        self.__dict__["_functions"] = (len(self.symbols), funcs)
+        return list(funcs)
 
-    def _without_padding(self, sym: Symbol) -> Symbol:
+    def _without_padding(self, sym: Symbol, marks: set[tuple[int | None, int]]) -> Symbol:
         section = self.sections.get(sym.section) if sym.section is not None else None
         end = sym.value + sym.size
         if section is None or section.nobits or sym.size % 4 or sym.size < 4:
             return sym
         if section.data[end - 2 : end] != b"\0\0":
             return sym
-        if not any(
-            m.name == "$d" and m.section == sym.section and m.value == end - 2 for m in self.symbols
-        ):
+        if (sym.section, end - 2) not in marks:
             return sym
         return replace(sym, size=sym.size - 2)
 

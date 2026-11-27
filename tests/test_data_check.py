@@ -77,3 +77,24 @@ def test_matching_layout_has_no_problems() -> None:
 def test_exported_labels_read_global_and_public_lines() -> None:
     text = "\t.global _021028B4, _021028C4\n\t.public gFoo ; comment\n_021028B4:\n"
     assert exported_labels(text) == ["_021028B4", "_021028C4", "gFoo"]
+
+
+def test_unreferenced_data_sections_are_dropped_like_the_linker_does() -> None:
+    from rematch.integrate.data_check import dead_sections
+
+    obj = candidate()  # sTable (section 1) points at sSmall (section 2); nothing points at 1
+    text = sec(3, ".text", bytes(4), 4)
+    lone = sec(4, ".rodata", bytes(8), 4)
+    table_ref = Reloc(0, "R_ARM_ABS32", Symbol("sTable", 0, 4, "OBJECT", "GLOBAL", 1), 0)
+    used = ObjectFile(
+        obj.path,
+        {**obj.sections, 3: Section(3, ".text", bytes(4), [table_ref], False, 4, 0x6, 4), 4: lone},
+        [*obj.symbols, Symbol("sLone", 0, 8, "OBJECT", "GLOBAL", 4)],
+    )
+    assert dead_sections(used, set()) == {4: ["sLone"]}  # sSmall lives through sTable
+    assert dead_sections(used, {"sLone"}) == {}  # another file uses it
+    assert dead_sections(ObjectFile(obj.path, {**obj.sections, 3: text}, obj.symbols), set()) == {
+        1: ["sTable"],
+        2: ["sSmall"],
+    }
+    assert 4 not in layouts(used, {4})[".rodata"].base

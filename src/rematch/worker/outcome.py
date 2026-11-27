@@ -80,7 +80,11 @@ def classify(
 
     state = State.load(sandbox)
     stop = history[-1].get("stop") if history else None
-    if not compiled:
+    api_error = invoke.result is None or bool(invoke.result.get("is_error"))
+    if not history and api_error:  # the worker never ran a check: not the function's fault
+        c.outcome = "error"
+        c.detail.append(str((invoke.result or {}).get("result", "")) or invoke.stderr_tail[-500:])
+    elif not compiled:
         c.outcome = "compile_fail"
     elif isinstance(stop, str) and stop.startswith("no new best"):
         c.outcome = "stagnation"

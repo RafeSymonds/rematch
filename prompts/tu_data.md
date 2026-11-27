@@ -1,4 +1,4 @@
-tu_data_version: 1
+tu_data_version: 2
 
 You are finishing a matching decompilation. {{ target_intro }} Every function of one
 assembly file is already C, in candidate.c, and matches. The file's data is still assembly,
@@ -20,6 +20,10 @@ How to work:
   or split objects, until the table lines up.
 - If a function stops matching after you define data it reads, the compiler may be folding
   loads of constant data; look at the function's diff before changing types.
+- Data no function refers to gets a section of its own, which the linker drops. When such
+  data holds a value a function uses as a constant (a color, a size), the original code read
+  it at a constant index and the compiler folded the load: write `table[0]` there instead of
+  the literal. It compiles to the same instructions and keeps the data in place.
 
 Rules: only edit candidate.c. Don't change function bodies beyond what the data needs. No
 inline asm, no #pragma, no new #include lines.

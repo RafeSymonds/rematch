@@ -11,6 +11,7 @@ import pytest
 from rematch.context.protos import (
     ProtosError,
     extract,
+    parameter_types,
     remove_block,
     replace_declarations,
     strip_declarations,
@@ -111,8 +112,18 @@ def test_compose_drops_the_block_from_pieces() -> None:
     assert "BOOL f(u16 a, void (*cb)(int, u8 *));" in piece  # from the definition
 
 
+def test_functions_c_calls_keep_their_parameters() -> None:
+    task: Any = SimpleNamespace(protos_allowed=["f", "g"], protos_keep_params=["f"])
+    ctx = "void f(void);\nvoid g(u8 x);\n"
+    assert protos_rejection({"f": "BOOL f(void);"}, task, ctx) is None  # return type only
+    reason = protos_rejection({"f": "BOOL f(u16 a);"}, task, ctx)
+    assert reason is not None and "keep them" in reason
+    assert protos_rejection({"g": "void g(int x);"}, task, ctx) is None  # nobody calls g
+    assert parameter_types("void h(unsigned int, Foo *p);") == ["unsigned int", "Foo *"]
+
+
 def test_only_the_target_and_listed_callees_may_be_redeclared() -> None:
-    task: Any = SimpleNamespace(protos_allowed=["f", "g"])
+    task: Any = SimpleNamespace(protos_allowed=["f", "g"], protos_keep_params=[])
     assert protos_rejection({"f": "", "g": ""}, task) is None
     reason = protos_rejection({"memset": ""}, task)
     assert reason is not None and "not memset" in reason and "(f, g)" in reason
@@ -139,3 +150,13 @@ def test_context_headers_get_the_headers_defining_their_types_first(tmp_path: Pa
     )
     out = with_type_dependencies(["include/widget.h"], index, tmp_path)
     assert out == ["include/constants/pool.h", "include/types.h", "include/widget.h"]
+
+
+def test_overrides_may_not_use_the_files_own_provisional_types() -> None:
+    from rematch.worker.check_entry import private_types
+
+    protos = extract(CANDIDATE)
+    assert private_types(protos, CANDIDATE) is None  # f and g use only ctx types
+    leaky = CANDIDATE.replace("void g(int x);", "void g(UnkStruct_0205 *p);")
+    reason = private_types(extract(leaky), leaky)
+    assert reason is not None and "UnkStruct_0205" in reason and "void *" in reason

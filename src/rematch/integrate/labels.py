@@ -39,10 +39,13 @@ def label_table(s: Session, entry: CompileEntry) -> Labels:
     source = (entry.directory / entry.source_arg).resolve()
     text = source.read_text(encoding="utf-8", errors="replace")
     key = hashlib.sha1((text + "\0" + json.dumps(entry.argv)).encode()).hexdigest()[:16]
+    if key in _TABLES:
+        return _TABLES[key]
     cache = s.settings.rematch_var / "labels" / f"{key}.json"
     if cache.is_file():
         raw = json.loads(cache.read_text(encoding="utf-8"))
-        return {sec: [(int(o), str(n)) for o, n in rows] for sec, rows in raw.items()}
+        _TABLES[key] = {sec: [(int(o), str(n)) for o, n in rows] for sec, rows in raw.items()}
+        return _TABLES[key]
     labels = defined_labels(text)
     # workers on the same TU build this table at the same time: each assembles in its own
     # directory, and the cache is replaced atomically
@@ -66,7 +69,11 @@ def label_table(s: Session, entry: CompileEntry) -> Labels:
     tmp = cache.with_name(f".{cache.name}.{os.getpid()}.{threading.get_ident()}")
     tmp.write_text(json.dumps(table), encoding="utf-8")
     os.replace(tmp, cache)
+    _TABLES[key] = table
     return table
+
+
+_TABLES: dict[str, Labels] = {}  # in-process copies of the cache, by key
 
 
 def labels_from_object(obj: ObjectFile, labels: list[str]) -> Labels:

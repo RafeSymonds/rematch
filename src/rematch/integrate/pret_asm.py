@@ -12,7 +12,7 @@ another gets `.global` where it is defined and `.public` where it is used.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 
 from rematch.inventory.asm_parser import AsmFunction, parse_pret_macros
@@ -21,6 +21,8 @@ _SECTION = re.compile(r"^\s*\.(?:text|data|rodata|bss|section\s+\S+.*)\s*$")
 _TEXT = re.compile(r"^\s*\.text\s*$")
 _LABEL_DEF = re.compile(r"^\s*([A-Za-z_.$][\w.$]*):")  # labels may be indented
 _TOKEN = re.compile(r"[A-Za-z_.$][\w.$]*")
+_REFERENCE = re.compile(r"^\s*\.(?:extern|public)\s+[A-Za-z_.$][\w.$]*\s*(?:[;@].*)?$")
+_ALIGN = re.compile(r"^\s*\.(?:balign|align|p2align)\b[^;@]*(?:[;@].*)?$")
 
 
 class SplitError(Exception):
@@ -66,22 +68,47 @@ def parse_tu(text: str) -> ParsedTU:
             in_func[i] = f
     header: list[str] = []
     segments: list[Segment] = []
+    prefix: list[str] = []  # alignment before a segment's first function
+    in_comment = False
     for i, line in enumerate(lines, 1):
         if i in in_func:
             f = in_func[i]
             if not segments or not segments[-1].is_text:
                 raise SplitError(f"{f.name} is outside a .text section")
             if i == f.start_line:
+                if prefix:
+                    f = replace(f, text="\n".join([*prefix, f.text]))
+                    prefix = []
                 segments[-1].functions.append(f)
             continue
-        if _SECTION.match(line):
+        if _SECTION.match(line) and not in_comment:
             segments.append(Segment(line))
+            prefix = []
             continue
         if not segments:
             header.append(line)
         elif segments[-1].is_text:
-            if line.strip():  # anything but blank lines between functions is not ours to move
-                raise SplitError(f"line {i}: {line.strip()!r} in .text outside a function")
+            # between functions: comments go, symbol references join the header (every piece
+            # gets it), alignment stays with the function before it (or after, at the start)
+            stripped = line.strip()
+            if in_comment:
+                in_comment = "*/" not in stripped
+                continue
+            if stripped.startswith("/*"):
+                in_comment = "*/" not in stripped[2:]
+                continue
+            if not stripped or stripped.startswith((";", "@", "//")):
+                continue
+            if _REFERENCE.match(line):
+                header.append(line)
+            elif _ALIGN.match(line):
+                funcs_here = segments[-1].functions
+                if funcs_here:
+                    funcs_here[-1] = replace(funcs_here[-1], text=f"{funcs_here[-1].text}\n{line}")
+                else:
+                    prefix.append(line)
+            else:
+                raise SplitError(f"line {i}: {stripped!r} in .text outside a function")
         else:
             segments[-1].lines.append(line)
     return ParsedTU(header, segments)

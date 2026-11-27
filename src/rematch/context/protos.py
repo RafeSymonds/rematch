@@ -158,3 +158,62 @@ def replace_declarations(text: str, name: str, decl: str) -> str | None:
     for a, b in reversed(spans):
         text = text[:a] + decl + text[b:]
     return text
+
+
+_C_TYPE_WORDS = frozenset(
+    [
+        "void",
+        "char",
+        "short",
+        "int",
+        "long",
+        "float",
+        "double",
+        "signed",
+        "unsigned",
+        "const",
+        "volatile",
+        "struct",
+        "union",
+        "enum",
+    ]
+)
+
+
+def _split_top(text: str) -> list[str]:
+    parts: list[str] = []
+    cur: list[str] = []
+    depth = 0
+    for ch in text:
+        if ch == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+            continue
+        depth += ch in "([{"
+        depth -= ch in ")]}"
+        cur.append(ch)
+    parts.append("".join(cur))
+    return [p.strip() for p in parts if p.strip()]
+
+
+def parameter_types(decl: str) -> list[str] | None:
+    """The parameter types of a prototype, names dropped (`(void)` is no parameters); None if
+    `decl` is not a prototype."""
+    m = re.search(rf"\((?P<params>{_PARAMS})\)\s*;?\s*$", " ".join(decl.split()))
+    if m is None:
+        return None
+    out = []
+    for param in _split_top(m.group("params")):
+        param = re.sub(r"\(\s*\*\s*[A-Za-z_]\w*\s*\)", "(*)", param)  # function pointer name
+        named = re.match(
+            r"^(?P<type>.*[\w\s\*])\b(?P<name>[A-Za-z_]\w*)\s*(?P<dims>(\[[^\]]*\])*)$", param
+        )
+        if named and named["name"] not in _C_TYPE_WORDS and re.search(r"\w", named["type"]):
+            param = named["type"] + named["dims"]
+        out.append(" ".join(param.replace("*", " * ").split()))
+    return [] if out == ["void"] else out
+
+
+def declared_prototype(ctx: str, name: str) -> str | None:
+    spans = declaration_spans(ctx, name)
+    return " ".join(ctx[spans[0][0] : spans[0][1]].split()) if spans else None

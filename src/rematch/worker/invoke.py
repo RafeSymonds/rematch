@@ -213,7 +213,10 @@ def run_worker(
     )
 
 
-_LIMIT = re.compile(r"usage limit|rate.?limit|\b429\b|overloaded|\b529\b", re.IGNORECASE)
+_LIMIT = re.compile(
+    r"usage.?limit|spend limit|limit resets|rate.?limit|\b429\b|overloaded|\b529\b", re.IGNORECASE
+)
+_HARD = re.compile(r"usage.?limit|spend limit|limit resets", re.IGNORECASE)
 _RESET = re.compile(r"limit reached\|(\d{9,11})")
 
 
@@ -225,7 +228,8 @@ def rate_limit_wait(r: InvokeResult, now: float, attempt: int) -> float | None:
     """
     text = ""
     if r.result is not None and r.result.get("is_error"):
-        text = str(r.result.get("result", "")) + " " + str(r.result.get("subtype", ""))
+        fields = ("result", "subtype", "api_error", "api_error_type", "api_error_status")
+        text = " ".join(str(r.result.get(k, "")) for k in fields)
     elif r.result is None:
         text = r.stderr_tail
     if not text or not _LIMIT.search(text):
@@ -233,4 +237,6 @@ def rate_limit_wait(r: InvokeResult, now: float, attempt: int) -> float | None:
     reset = _RESET.search(text)
     if reset:
         return float(min(max(int(reset.group(1)) - now, 60), 6 * 3600))
+    if _HARD.search(text):  # a usage or spend limit lasts hours: probe again hourly
+        return 3600.0
     return float(min(60 * 2**attempt, 900))

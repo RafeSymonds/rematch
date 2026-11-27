@@ -120,6 +120,9 @@ def recover_leases(conn: sqlite3.Connection) -> int:
     return cur.rowcount
 
 
+ERROR_STREAK_STOP = 25  # consecutive errored attempts that stop launches
+
+
 def pick_order(conn: sqlite3.Connection, n_rungs: int, cooldown: float) -> list[tuple[int, int]]:
     """(function id, rung) in work order: TUs with the fewest unmatched functions first."""
     ready_before = _iso(datetime.now(UTC) - timedelta(seconds=cooldown))
@@ -149,7 +152,7 @@ def acquire(conn: sqlite3.Connection, fid: int, owner: str, ttl: float) -> bool:
 def settle(conn: sqlite3.Connection, fid: int, c: Classified | None, n_rungs: int) -> None:
     """After an attempt: clear the lease; a miss climbs the ladder or becomes stuck."""
     with conn:
-        if c is None:  # harness error before the attempt recorded anything
+        if c is None or c.outcome == "error":  # harness or API error: the function is not at fault
             conn.execute(
                 "UPDATE functions SET status = CASE WHEN attempts = 0 THEN 'untried'"
                 " ELSE 'failed' END WHERE id = ? AND status = 'leased'",
@@ -241,6 +244,7 @@ def run_live(
             hconn.close()
 
     integrating: threading.Thread | None = None
+    lock_noted = threading.Event()
 
     def integrate_bg() -> None:
         if integrate_fn is None:
@@ -248,7 +252,13 @@ def run_live(
         try:
             stats.integrated += integrate_fn()
         except Exception as exc:  # integration problems must not stop matching
+            if "another integration holds" in str(exc):
+                if not lock_noted.is_set():  # another process lands; the next cycle retries
+                    log("integration waits: another process holds the integration lock")
+                    lock_noted.set()
+                return
             log(f"integration error: {exc!r}")
+        lock_noted.clear()
 
     def one(fn: FunctionRecord, rung: int) -> tuple[FunctionRecord, Classified | None]:
         gate.wait()
@@ -281,6 +291,7 @@ def run_live(
     hb.start()
     conn = store.connect(s.db_path)
     since_integration = 0
+    error_streak = 0
     try:
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
             running: dict[Future[tuple[FunctionRecord, Classified | None]], int] = {}
@@ -314,9 +325,18 @@ def run_live(
                     fid = running.pop(fut)
                     fn, c = fut.result()
                     settle(conn, fid, c, len(rungs))
-                    if c is None:
+                    if c is None or c.outcome == "error":
                         stats.errors += 1
-                    elif c.outcome == "match":
+                        error_streak += 1
+                        if error_streak >= ERROR_STREAK_STOP and not stop.is_set():
+                            log(
+                                f"stopping launches: {error_streak} attempts in a row ended in"
+                                " errors (API or harness); see the last attempt's transcript"
+                            )
+                            stop.set()
+                        continue
+                    error_streak = 0
+                    if c.outcome == "match":
                         stats.matched += 1
                         since_integration += 1
                     else:

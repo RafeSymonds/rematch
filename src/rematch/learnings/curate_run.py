@@ -100,7 +100,7 @@ def target_names(s: Session, conn: sqlite3.Connection) -> set[str]:
     """Identifiers that belong to the target: function names and header declarations."""
     names = {str(n) for (n,) in conn.execute("SELECT name FROM functions")}
     if s.header_index_path.is_file():
-        index = HeaderIndex.from_json(s.header_index_path.read_text(encoding="utf-8"))
+        index = HeaderIndex.load(s.header_index_path)
         names |= set(index._by_name)
     generic = set(re.findall(r"\b\w+\b", trial_header(s)))
     return names - generic - _C_WORDS

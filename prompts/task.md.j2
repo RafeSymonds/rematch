@@ -41,8 +41,8 @@ assembly file, which stays as it is. Declare it `extern` with exactly that name 
 type; don't define it in candidate.c.
 {% endif %}
 
-{% if protos_allowed %}
-Prototypes a rematch:protos block may correct: {{ protos_allowed|join(", ") }}.
+{% if protos_allowed is defined and protos_allowed %}
+Prototypes a rematch:protos block may correct: {{ protos_allowed|join(", ") }}.{% if keep_params is defined and keep_params %} C files call {{ keep_params|join(", ") }}: change only the return type there.{% endif %}
 {% endif %}
 
 Write the function {{ symbol }} in candidate.c, run ./check, iterate to MATCH.

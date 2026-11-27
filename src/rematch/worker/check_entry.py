@@ -13,7 +13,12 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from rematch.context.protos import ProtosError, strip_declarations
+from rematch.context.protos import (
+    ProtosError,
+    declared_prototype,
+    parameter_types,
+    strip_declarations,
+)
 from rematch.context.protos import extract as extract_protos
 from rematch.diff.hints import hints
 from rematch.diff.match import FunctionView, RelocEntry, binary_match, function_view
@@ -24,7 +29,7 @@ from rematch.inventory.c_parser import mask, parse_c_functions
 from rematch.toolchain.compile import compile_candidate, scratch_source
 from rematch.toolchain.objects import read_object
 from rematch.toolchain.runner import ToolchainRunner
-from rematch.types.provisional import check_block
+from rematch.types.provisional import TypesError, check_block, extract_block
 from rematch.worker.task import Task
 
 HISTORY = ".history"
@@ -90,15 +95,43 @@ def prefilter(candidate: str, symbol: str) -> str | None:
     return None
 
 
-def protos_rejection(protos: dict[str, str], task: Task) -> str | None:
+def protos_rejection(protos: dict[str, str], task: Task, ctx: str = "") -> str | None:
     """Reason to reject a rematch:protos block, or None."""
     bad = sorted(set(protos) - set(task.protos_allowed))
-    if not bad:
+    if bad:
+        allowed = ", ".join(task.protos_allowed) or "nothing in this task"
+        return (
+            f"rematch:protos may only redeclare the target and assembly-only callees ({allowed});"
+            f" not {', '.join(bad)}"
+        )
+    for name in sorted(set(protos) & set(task.protos_keep_params)):
+        old = declared_prototype(ctx, name)
+        if old is not None and parameter_types(old) != parameter_types(protos[name]):
+            return (
+                f"C files call {name} with the header's parameters ({old}): keep them; a"
+                " rematch:protos block may change only its return type"
+            )
+    return None
+
+
+def private_types(protos: dict[str, str], candidate: str) -> str | None:
+    """Reason to reject overrides that use this file's provisional types: the prototypes go
+    into a shared header, which can't see them."""
+    try:
+        body = extract_block(candidate) or ""
+    except TypesError:
         return None
-    allowed = ", ".join(task.protos_allowed) or "nothing in this task"
+    names = set(re.findall(r"\b(?:struct|union|enum)\s+([A-Za-z_]\w*)", body))
+    names |= set(re.findall(r"\}\s*([A-Za-z_]\w*)\s*;", body))
+    used = sorted(
+        {n for decl in protos.values() for n in re.findall(r"[A-Za-z_]\w*", decl) if n in names}
+    )
+    if not used:
+        return None
     return (
-        f"rematch:protos may only redeclare the target and assembly-only callees ({allowed});"
-        f" not {', '.join(bad)}"
+        f"rematch:protos uses {', '.join(used)}, which only this file declares; the prototype"
+        " goes into a shared header. Use a type ctx.h declares (void * for an unknown struct)"
+        " in both the prototype and the definition, and cast in the body."
     )
 
 
@@ -179,7 +212,7 @@ def evaluate(
         except ProtosError as exc:
             rejected = str(exc)
         else:
-            rejected = protos_rejection(protos, task)
+            rejected = protos_rejection(protos, task, ctx_text) or private_types(protos, candidate)
     if rejected is not None:
         return rejected, [], []
     runner = ToolchainRunner.from_spec(task.toolchain_exec)

@@ -388,9 +388,10 @@ def test_prompts_render() -> None:
         ctx_kb=1000,
         learnings="(none)",
         protos_allowed=["sub_1", "sub_2"],
+        keep_params=["sub_2"],
     )
     assert "\tbx lr" in task and "void sub_1(void);" in task and "1000 KB" in task
-    assert "rematch:protos block may correct: sub_1, sub_2" in task
+    assert "rematch:protos block may correct: sub_1, sub_2. C files call sub_2" in task
     assert "sub_1" in task and "every target version" in task and "draft.c" not in task
 
 
@@ -413,6 +414,16 @@ def test_rate_limit_wait_classification(tmp_path: Path) -> None:
     assert rate_limit_wait(usage, 1764200000, 0) == 600
     assert rate_limit_wait(res(None, "Error: 529 overloaded"), 0, 1) == 120
     assert rate_limit_wait(res({"is_error": True, "result": "compile crashed"}), 0, 0) is None
+    spend = res(
+        {
+            "is_error": True,
+            "subtype": "success",
+            "api_error_status": 429,
+            "api_error": "usage_limit_reached",
+            "result": "You've hit your monthly spend limit · your weekly limit resets at 9pm",
+        }
+    )
+    assert rate_limit_wait(spend, 0, 0) == 3600  # hard limit: probe hourly
 
 
 def test_rate_limited_attempt_resumes_session(tmp_path: Path) -> None:

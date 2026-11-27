@@ -34,7 +34,7 @@ from rematch.worker.sandbox import FunctionRecord, make_context
 from rematch.worker.task import CompileSpec
 
 STATE = "data_state.json"
-PROMPT_VERSION = 1
+PROMPT_VERSION = 2
 
 
 def data_check(sandbox: Path, control: Path) -> tuple[str, int]:

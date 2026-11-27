@@ -51,8 +51,21 @@ class HeaderIndex:
         return json.dumps(rows)
 
     @classmethod
+    def load(cls, path: Path) -> HeaderIndex:
+        """`from_json` of the file, parsed once per file version and process."""
+        st = path.stat()
+        key = (str(path), st.st_mtime_ns, st.st_size)
+        hit = _LOADED.get(key)
+        if hit is None:
+            hit = _LOADED[key] = cls.from_json(path.read_text(encoding="utf-8"))
+        return hit
+
+    @classmethod
     def from_json(cls, text: str) -> HeaderIndex:
         return cls([Declaration(n, h, k) for n, h, k in json.loads(text)])
+
+
+_LOADED: dict[tuple[str, int, int], HeaderIndex] = {}
 
 
 def build_header_index(ctags: str, root: Path, include_dirs: list[str]) -> HeaderIndex:

@@ -82,6 +82,25 @@ def test_stray_text_lines_refuse_to_split() -> None:
         parse_tu(TU.replace("\tthumb_func_start FuncB", "\t.word 0\n\tthumb_func_start FuncB"))
 
 
+def test_comments_references_and_alignment_between_functions_split() -> None:
+    text = (
+        TU.replace("\t.text\n\n", "\t.text\n\n\t.extern Ext_Func\n\t.balign 4, 0\n\n", 1)
+        .replace("\tthumb_func_start FuncB", "\t; File boundary?\n\tthumb_func_start FuncB")
+        .replace(
+            "\tthumb_func_start FuncC",
+            "\t.balign 4, 0\n/*\n * int FuncC(void) {\n */\n\tthumb_func_start FuncC",
+        )
+    )
+    parsed = parse_tu(text)
+    funcs = {f.name: f for f in parsed.functions}
+    assert "\t.extern Ext_Func" in parsed.header  # every piece gets the header
+    assert funcs["FuncA"].text.startswith("\t.balign 4, 0\n\tthumb_func_start FuncA")
+    assert funcs["FuncB"].text.endswith("thumb_func_end FuncB\n\t.balign 4, 0")
+    assert "File boundary" not in "".join(f.text for f in parsed.functions)
+    pieces = render_asm_pieces(parsed, plan_pieces("asm/foo.s", parsed, set()), set())
+    assert "\t.extern Ext_Func" in pieces["asm/foo.s"]
+
+
 def test_linkspec_replaces_consecutive_lines() -> None:
     lsf = "Static main\n{\n    Object asm/a.s\n    Object asm/foo.s\n    Object src/b.c\n}\n"
     out = replace_objects_nitro_lsf(lsf, ["asm/foo.s"], ["asm/foo.s", "src/foo_0200000C.c"])

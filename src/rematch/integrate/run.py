@@ -167,11 +167,7 @@ def prepare_piece(
     control: Path,
 ) -> tuple[PieceSpec, str]:
     """Write the piece's control data (targets per function and version) and compose it."""
-    index = (
-        HeaderIndex.from_json(s.header_index_path.read_text(encoding="utf-8"))
-        if s.header_index_path.is_file()
-        else None
-    )
+    index = HeaderIndex.load(s.header_index_path) if s.header_index_path.is_file() else None
     build = s.definition.require(s.definition.build_info, "build")
     asm_text = {f.name: f.text for f in parsed.functions}
     includes: list[str] = []
@@ -712,7 +708,10 @@ def _apply(
 
 def culprit(problems: list[str], batch: list[PreparedTU]) -> PreparedTU | None:
     """The one TU whose piece file names appear in the build errors, if exactly one does."""
-    text = "\n".join(problems)
+    # diagnostics only: build progress lines name every object being compiled
+    text = "\n".join(
+        ln for pr in problems for ln in pr.splitlines() if not re.match(r"^\s*\[\s*\d+%", ln)
+    )
     hits = [
         p
         for p in batch
